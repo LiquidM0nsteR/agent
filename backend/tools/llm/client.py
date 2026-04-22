@@ -4,7 +4,8 @@ import asyncio
 from contextvars import ContextVar, Token
 from functools import lru_cache
 from pathlib import Path
-from threading import Thread
+from threading import Lock, Thread
+import time
 from typing import Any
 from urllib.parse import urlparse
 
@@ -40,6 +41,7 @@ class LocalQwenVLClient:
     def __init__(self, model_path: Path) -> None:
         self.model_path = model_path
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
+        self._generation_lock = Lock()
 
         self.processor = AutoProcessor.from_pretrained(
             str(self.model_path),
@@ -166,49 +168,57 @@ class LocalQwenVLClient:
         repetition_penalty: float = 1.05,
         trace_label: str = "local_qwen_invoke",
     ) -> str:
-        normalized_messages = self._normalize_messages(messages)
+        started_at = time.perf_counter()
+        # 共享模型实例只允许单路推理，避免不同会话同时打到同一份权重。
+        with self._generation_lock:
+            normalized_messages = self._normalize_messages(messages)
 
-        text = self.processor.apply_chat_template(
-            normalized_messages,
-            tokenize=False,
-            add_generation_prompt=True,
-        )
-
-        image_inputs, video_inputs = process_vision_info(normalized_messages)
-
-        inputs = self.processor(
-            text=[text],
-            images=image_inputs,
-            videos=video_inputs,
-            padding=True,
-            return_tensors="pt",
-        )
-        inputs = {k: v.to(self.model.device) for k, v in inputs.items()}
-
-        with torch.no_grad():
-            outputs = self.model.generate(
-                **inputs,
-                max_new_tokens=max_new_tokens,
-                temperature=temperature,
-                repetition_penalty=repetition_penalty,
-                do_sample=temperature > 0,
+            text = self.processor.apply_chat_template(
+                normalized_messages,
+                tokenize=False,
+                add_generation_prompt=True,
             )
 
-        generated_ids = outputs[0][inputs["input_ids"].shape[1]:]
-        text_output = self.processor.decode(
-            generated_ids,
-            skip_special_tokens=True,
-            clean_up_tokenization_spaces=False,
-        ).strip()
+            image_inputs, video_inputs = process_vision_info(normalized_messages)
 
-        _append_llm_trace(
-            label=trace_label,
-            messages=normalized_messages,
-            response=text_output,
-            model_path=str(self.model_path),
-            device=self.device,
-        )
-        return text_output
+            inputs = self.processor(
+                text=[text],
+                images=image_inputs,
+                videos=video_inputs,
+                padding=True,
+                return_tensors="pt",
+            )
+            inputs = {k: v.to(self.model.device) for k, v in inputs.items()}
+            do_sample = temperature > 0
+
+            with torch.no_grad():
+                generation_kwargs: dict[str, Any] = {
+                    **inputs,
+                    "max_new_tokens": max_new_tokens,
+                    "repetition_penalty": repetition_penalty,
+                    "do_sample": do_sample,
+                }
+                if do_sample:
+                    generation_kwargs["temperature"] = temperature
+                outputs = self.model.generate(**generation_kwargs)
+
+            generated_ids = outputs[0][inputs["input_ids"].shape[1]:]
+            text_output = self.processor.decode(
+                generated_ids,
+                skip_special_tokens=True,
+                clean_up_tokenization_spaces=False,
+            ).strip()
+            elapsed_ms = round((time.perf_counter() - started_at) * 1000, 2)
+
+            _append_llm_trace(
+                label=trace_label,
+                messages=normalized_messages,
+                response=text_output,
+                model_path=str(self.model_path),
+                device=self.device,
+                elapsed_ms=elapsed_ms,
+            )
+            return text_output
 
     async def ainvoke(
         self,
@@ -256,6 +266,7 @@ async def local_chat_completion(
     trace_label: str = "local_chat_completion",
 ) -> dict[str, Any]:
     # 提供一个稳定的小包装，调用方不需要了解底层 client 细节。
+    started_at = time.perf_counter()
     client = get_local_qwen_client()
     text = await client.ainvoke(
         messages,
@@ -268,6 +279,9 @@ async def local_chat_completion(
         "message": text,
         "model_path": str(client.model_path),
         "device": client.device,
+        "metrics": {
+            "inference_ms": round((time.perf_counter() - started_at) * 1000, 2),
+        },
     }
 
 
@@ -280,72 +294,88 @@ async def local_chat_completion_stream(
     trace_label: str = "local_chat_completion_stream",
 ):
     # 使用 transformers streamer 提供逐段输出，供上层直接转成前端流事件。
+    started_at = time.perf_counter()
     client = get_local_qwen_client()
-    normalized_messages = client._normalize_messages(messages)
-    text = client.processor.apply_chat_template(
-        normalized_messages,
-        tokenize=False,
-        add_generation_prompt=True,
-    )
-    image_inputs, video_inputs = process_vision_info(normalized_messages)
-    inputs = client.processor(
-        text=[text],
-        images=image_inputs,
-        videos=video_inputs,
-        padding=True,
-        return_tensors="pt",
-    )
-    inputs = {k: v.to(client.model.device) for k, v in inputs.items()}
+    worker: Thread | None = None
+    lock_acquired = False
 
-    streamer = TextIteratorStreamer(
-        client.processor,
-        skip_special_tokens=True,
-        clean_up_tokenization_spaces=False,
-        skip_prompt=True,
-    )
-    generation_error: dict[str, Any] = {}
+    try:
+        await asyncio.to_thread(client._generation_lock.acquire)
+        lock_acquired = True
 
-    def _run_generation() -> None:
-        try:
-            with torch.no_grad():
-                client.model.generate(
-                    **inputs,
-                    max_new_tokens=max_new_tokens,
-                    temperature=temperature,
-                    repetition_penalty=repetition_penalty,
-                    do_sample=temperature > 0,
-                    streamer=streamer,
-                )
-        except Exception as exc:  # pragma: no cover - 生成错误只在运行期出现
-            generation_error["error"] = exc
-            streamer.on_finalized_text("", stream_end=True)
+        normalized_messages = client._normalize_messages(messages)
+        text = client.processor.apply_chat_template(
+            normalized_messages,
+            tokenize=False,
+            add_generation_prompt=True,
+        )
+        image_inputs, video_inputs = process_vision_info(normalized_messages)
+        inputs = client.processor(
+            text=[text],
+            images=image_inputs,
+            videos=video_inputs,
+            padding=True,
+            return_tensors="pt",
+        )
+        inputs = {k: v.to(client.model.device) for k, v in inputs.items()}
+        do_sample = temperature > 0
 
-    worker = Thread(target=_run_generation, daemon=True)
-    worker.start()
+        streamer = TextIteratorStreamer(
+            client.processor,
+            skip_special_tokens=True,
+            clean_up_tokenization_spaces=False,
+            skip_prompt=True,
+        )
+        generation_error: dict[str, Any] = {}
 
-    collected_chunks: list[str] = []
-    iterator = iter(streamer)
-    while True:
-        chunk = await asyncio.to_thread(next, iterator, None)
-        if chunk is None:
-            break
-        text_chunk = str(chunk)
-        if not text_chunk:
-            continue
-        collected_chunks.append(text_chunk)
-        yield text_chunk
+        def _run_generation() -> None:
+            try:
+                with torch.no_grad():
+                    generation_kwargs: dict[str, Any] = {
+                        **inputs,
+                        "max_new_tokens": max_new_tokens,
+                        "repetition_penalty": repetition_penalty,
+                        "do_sample": do_sample,
+                        "streamer": streamer,
+                    }
+                    if do_sample:
+                        generation_kwargs["temperature"] = temperature
+                    client.model.generate(**generation_kwargs)
+            except Exception as exc:  # pragma: no cover - 生成错误只在运行期出现
+                generation_error["error"] = exc
+                streamer.on_finalized_text("", stream_end=True)
 
-    await asyncio.to_thread(worker.join)
-    if generation_error.get("error") is not None:
-        raise generation_error["error"]
+        worker = Thread(target=_run_generation, daemon=True)
+        worker.start()
 
-    _append_llm_trace(
-        label=trace_label,
-        messages=normalized_messages,
-        response="".join(collected_chunks).strip(),
-        model_path=str(client.model_path),
-        device=client.device,
-    )
+        collected_chunks: list[str] = []
+        iterator = iter(streamer)
+        while True:
+            chunk = await asyncio.to_thread(next, iterator, None)
+            if chunk is None:
+                break
+            text_chunk = str(chunk)
+            if not text_chunk:
+                continue
+            collected_chunks.append(text_chunk)
+            yield text_chunk
+
+        if generation_error.get("error") is not None:
+            raise generation_error["error"]
+
+        _append_llm_trace(
+            label=trace_label,
+            messages=normalized_messages,
+            response="".join(collected_chunks).strip(),
+            model_path=str(client.model_path),
+            device=client.device,
+            elapsed_ms=round((time.perf_counter() - started_at) * 1000, 2),
+        )
+    finally:
+        if worker is not None:
+            await asyncio.to_thread(worker.join)
+        if lock_acquired:
+            client._generation_lock.release()
 
 
 def begin_llm_trace_session() -> Token:
@@ -365,6 +395,7 @@ def _append_llm_trace(
     response: str,
     model_path: str,
     device: str,
+    elapsed_ms: float | None = None,
 ) -> None:
     buffer = _LLM_TRACE_BUFFER.get()
     if buffer is None:
@@ -377,6 +408,7 @@ def _append_llm_trace(
             "device": device,
             "prompt_preview": _build_prompt_preview(messages),
             "response_preview": response[:1200],
+            "elapsed_ms": elapsed_ms,
         }
     )
 

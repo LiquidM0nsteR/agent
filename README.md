@@ -1,41 +1,52 @@
 # Agent Backend + Chat UI
 
 本项目当前包含：
-- FastAPI 后端入口（`backend/main.py`）
-- LangGraph 编排与工具路由（`backend/planning.py`）
-- 本地 RAG + Web Search + 单细胞分析工具链
-- 登录与会话管理（按 `user_id/session_id`）
-- 长短期记忆（短期会话记忆 + 长期 profile/semantic memory）
+- FastAPI 后端入口：`backend/main.py`
+- LangGraph 工作流图：`backend/agent.py`
+- LangGraph 节点与运行时实现：`backend/agent_runtime.py`
+- 本地 RAG、网页搜索、单细胞分析、多模态问答工具链
+- 登录、会话管理、长短期记忆与前端工作台
 
-## 1. 环境准备
+## 1. 目录说明
 
-```powershell
-& E:\miniconda\shell\condabin\conda-hook.ps1
+- `backend/main.py`：API 入口、SSE 流式输出、会话与工作台接口。
+- `backend/agent.py`：只保留 LangGraph 的 state graph 结构和对外入口。
+- `backend/agent_runtime.py`：节点逻辑、ReAct 路由、工具执行、finalize 与记忆写回。
+- `backend/tools/`：LLM、RAG、Web Search、单细胞分析工具。
+- `backend/memory/`：Redis 短期记忆 + SQLite 长期记忆。
+- `build_index.py`：重建本地知识库 BM25 + Qdrant 索引。
+- `frontend/`：聊天 UI。
+
+## 2. 环境准备
+
+```bash
 conda activate agent
 pip install -r requirements.txt
 ```
 
-## 2. 启动服务
+如果启用了 Redis 短期记忆，需要先确保本机 Redis 可用。最简单的方式是直接启动：
 
-```powershell
-& E:\miniconda\shell\condabin\conda-hook.ps1; conda activate agent; uvicorn backend.main:app --host 0.0.0.0 --port 8000 --reload
+```bash
+redis-server
 ```
 
-浏览器访问：`http://127.0.0.1:8000/`
+## 3. 配置项
 
-## 3. 配置项（.env）
+从 `.env.example` 复制为 `.env` 后按需填写。当前真实运行至少要关注这几组变量：
 
-可从 `.env.example` 复制后按需填写。核心分组如下：
-
-- LLM 路由与生成：
-  - `QWEN_API_KEY`
-  - `QWEN_BASE_URL`
-  - `QWEN_MODEL`
-  - `QWEN_ROUTER_MODEL`
-  - `QWEN_ANALYSIS_MODEL`
-- Web 检索：
+- 本地模型：
+  - `LLM_MODEL_PATH`
+  - `EMBEDDING_MODEL_PATH`
+- Web Search：
   - `SERPER_API_KEY`
 - 记忆系统：
+  - `MEMORY_REDIS_HOST`
+  - `MEMORY_REDIS_PORT`
+  - `MEMORY_REDIS_DB`
+  - `MEMORY_REDIS_PASSWORD`
+  - `PROFILE_STORAGE_PATH`
+  - `SEMANTIC_QDRANT_PATH`
+- 行为控制：
   - `SHORT_TERM_MAX_MESSAGES`
   - `SHORT_TERM_MAX_APPROX_TOKENS`
   - `SHORT_TERM_SUMMARY_THRESHOLD`
@@ -43,36 +54,55 @@ pip install -r requirements.txt
   - `ENABLE_PROFILE_MEMORY`
   - `ENABLE_SEMANTIC_MEMORY`
   - `SEMANTIC_MEMORY_COLLECTION`
-  - `SEMANTIC_QDRANT_PATH`
-  - `PROFILE_STORAGE_PATH`
+  - `QDRANT_LOCK_TIMEOUT_SECONDS`
 
-## 4. 登录与会话
+说明：
+- Web Search 不再内置默认密钥；未配置 `SERPER_API_KEY` 时会返回 `unavailable`。
+- 短期记忆使用 Redis，长期记忆使用 SQLite。
 
-前端支持：
-- 登录（本地轻量登录，使用 `user_id`）
-- 新建对话（前端清空当前上下文，首条消息创建新 session）
-- 切换历史会话（读取会话消息历史）
+## 4. 启动服务
 
-后端会话相关接口：
-- `POST /api/auth/login`
-- `GET /api/users/{user_id}/sessions`
-- `GET /api/users/{user_id}/sessions/{session_id}`
-- `POST /api/agent/submit`（支持传入 `user_id`、`session_id` 进行续聊）
-
-会话数据默认落盘路径：
-- `data/users/<user_id>/sessions/<session_id>/...`
-
-## 5. 最小验证
-
-```powershell
-& E:\miniconda\shell\condabin\conda-hook.ps1; conda activate agent; python -m py_compile backend\main.py backend\planning.py backend\sc_analysis\skill.py
+```bash
+uvicorn backend.main:app --host 0.0.0.0 --port 8000 --reload
 ```
 
-## 6. 发布前检查清单
+浏览器访问：`http://127.0.0.1:8000/`
 
-1. `python -m py_compile backend\main.py backend\planning.py backend\sc_analysis\skill.py` 通过。  
-2. 手工验证：登录 -> 新建对话 -> 连续发送两条消息 -> 切换会话 -> 返回原会话。  
-3. 检查 `data/users/...` 下会话目录是否按用户隔离。  
-4. 未配置 `QWEN_API_KEY` 时，接口应返回 mock/降级结果且不崩溃。  
-5. 若启用语义记忆，确认 `data/local_knowledge_index/qdrant` 可写。  
-6. 若启用 PDF 多模态分析，确认 `PyMuPDF` 可导入（`import fitz`）。  
+## 5. 重建本地知识库索引
+
+```bash
+python build_index.py
+```
+
+该脚本会：
+- 解析 `data/local_knowledge/`
+- 生成 `data/local_knowledge_index/bm25.pkl`
+- 重建 `data/local_knowledge_index/qdrant`
+- 刷新 `data/local_knowledge_index/chunks.jsonl`
+
+## 6. 会话与记忆
+
+- 登录接口：`POST /api/auth/login`
+- 会话列表：`GET /api/users/{user_id}/sessions`
+- 会话详情：`GET /api/users/{user_id}/sessions/{session_id}`
+- 提交消息：`POST /api/agent/submit`
+- 清理短期记忆：`POST /api/users/{user_id}/workspace/memory/clear`
+
+默认会话目录：
+
+```text
+data/users/<user_id>/sessions/<session_id>/
+```
+
+## 7. 最小校验
+
+```bash
+python -m py_compile backend/main.py backend/agent.py backend/agent_runtime.py
+```
+
+然后至少手工验证：
+
+1. 登录后连续发送两条消息，确认仍在同一会话。
+2. 上传图片、PDF、h5ad，确认各自路由正确。
+3. 本地知识库无证据时，确认会自动回退到网页搜索。
+4. Redis 关闭时，确认记忆层会报清晰错误而不是静默失效。

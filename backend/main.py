@@ -3,13 +3,15 @@ from __future__ import annotations
 import asyncio
 from contextlib import asynccontextmanager
 import json
+import logging
 import shutil
 from datetime import datetime
 from pathlib import Path
+import time
 from typing import Any
 from uuid import uuid4
 
-from fastapi import FastAPI, File, Form, HTTPException, Query, UploadFile
+from fastapi import FastAPI, File, Form, HTTPException, Query, Request, UploadFile
 from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
@@ -59,6 +61,7 @@ TOOL_STATUS: dict[str, dict[str, Any]] = {
     "retrieval_index": {"state": "idle", "detail": "", "updated_at": ""},
 }
 _MEMORY_MANAGER = MemoryManager(get_config())
+logger = logging.getLogger(__name__)
 
 
 def _safe_filename(filename: str | None) -> str:
@@ -274,9 +277,12 @@ def _build_route_trace(agent_payload: dict[str, Any]) -> dict[str, Any]:
         normalized_llm_traces.append(
             {
                 "label": str(item.get("label") or ""),
-                "response": str(item.get("response") or ""),
+                "response": str(
+                    item.get("response") or item.get("response_preview") or ""
+                ),
                 "prompt_preview": str(item.get("prompt_preview") or ""),
                 "model_path": str(item.get("model_path") or ""),
+                "elapsed_ms": item.get("elapsed_ms"),
             }
         )
     return {
@@ -387,6 +393,7 @@ def _list_knowledge_files() -> list[dict[str, Any]]:
 
 
 def _rebuild_local_knowledge_index() -> dict[str, Any]:
+    started_at = time.perf_counter()
     config = get_config()
     builder = KnowledgeBaseBuilder(config)
     chunks, errors = builder.build()
@@ -398,23 +405,35 @@ def _rebuild_local_knowledge_index() -> dict[str, Any]:
     vector_count = 0
     if chunks:
         embedder = BgeM3Embedder(config)
-        vectors = embedder.encode([chunk.text for chunk in chunks], batch_size=8)
-        vector_store = QdrantVectorStore(config)
-        vector_store.replace_collection(chunks, vectors)
-        vector_count = len(vectors)
+        try:
+            vectors = embedder.encode([chunk.text for chunk in chunks], batch_size=8)
+            vector_store = QdrantVectorStore(config)
+            vector_store.replace_collection(chunks, vectors)
+            vector_count = len(vectors)
+        finally:
+            embedder.close()
     else:
         # No chunks means knowledge base is empty; clear stale vector directory if present.
         if config.qdrant_path.exists():
             shutil.rmtree(config.qdrant_path)
 
     source_docs = len(builder.scan_documents())
-    return {
+    result = {
         "status": "ok",
         "source_documents": source_docs,
         "chunk_count": len(chunks),
         "vector_count": vector_count,
         "errors": errors,
+        "elapsed_ms": round((time.perf_counter() - started_at) * 1000, 2),
     }
+    logger.info(
+        "[knowledge.rebuild] source_documents=%s chunks=%s vectors=%s elapsed_ms=%.2f",
+        result["source_documents"],
+        result["chunk_count"],
+        result["vector_count"],
+        result["elapsed_ms"],
+    )
+    return result
 
 
 def _detect_file_kind(upload: UploadFile) -> str:
@@ -447,6 +466,8 @@ def _save_upload(upload: UploadFile, uploads_dir: Path) -> dict[str, Any]:
         "size_bytes": destination.stat().st_size,
         "path": str(destination.relative_to(BASE_DIR)),
     }
+
+
 class LoginRequest(BaseModel):
     user_id: str
 
@@ -489,6 +510,36 @@ async def app_lifespan(app: FastAPI):
 
 app = FastAPI(title="Agent Entry API", version="0.1.0", lifespan=app_lifespan)
 app.mount("/assets", StaticFiles(directory=FRONTEND_DIR), name="assets")
+
+
+@app.middleware("http")
+async def request_logging_middleware(request: Request, call_next):
+    request_id = uuid4().hex[:12]
+    started_at = time.perf_counter()
+    request.state.request_id = request_id
+    try:
+        response = await call_next(request)
+    except Exception:
+        elapsed_ms = round((time.perf_counter() - started_at) * 1000, 2)
+        logger.exception(
+            "[http] request_id=%s method=%s path=%s status=500 elapsed_ms=%.2f",
+            request_id,
+            request.method,
+            request.url.path,
+            elapsed_ms,
+        )
+        raise
+    elapsed_ms = round((time.perf_counter() - started_at) * 1000, 2)
+    response.headers["X-Request-ID"] = request_id
+    logger.info(
+        "[http] request_id=%s method=%s path=%s status=%s elapsed_ms=%.2f",
+        request_id,
+        request.method,
+        request.url.path,
+        response.status_code,
+        elapsed_ms,
+    )
+    return response
 
 
 @app.middleware("http")
@@ -751,6 +802,7 @@ async def delete_user_session(user_id: str, session_id: str) -> dict[str, Any]:
 
 @app.post("/api/agent/submit")
 async def submit_agent_input(
+    request: Request,
     user_id: str = Form(default="anonymous"),
     session_id: str = Form(default=""),
     text: str = Form(default=""),
@@ -758,6 +810,8 @@ async def submit_agent_input(
     images: list[UploadFile] | None = File(default=None),
     h5ad_files: list[UploadFile] | None = File(default=None),
 ) -> StreamingResponse:
+    request_id = str(getattr(request.state, "request_id", "") or uuid4().hex[:12])
+    request_started_at = time.perf_counter()
     attachments = [*(files or []), *(images or []), *(h5ad_files or [])]
 
     if not text.strip() and not attachments:
@@ -795,6 +849,14 @@ async def submit_agent_input(
         ],
         workspace_settings=workspace_settings,
     )
+    logger.info(
+        "[agent.request] request_id=%s user=%s session=%s text_len=%s files=%s",
+        request_id,
+        safe_user_id,
+        safe_session_id,
+        len(text or ""),
+        len(saved_files),
+    )
 
     _set_tool_status("agent", "running", "Agent routing and tool execution in progress")
     _set_tool_status("local_llm", "running", "Local model inference in progress")
@@ -808,6 +870,7 @@ async def submit_agent_input(
             yield _sse_event(
                 "accepted",
                 {
+                    "request_id": request_id,
                     "user_id": safe_user_id,
                     "session_id": safe_session_id,
                     "text": text,
@@ -829,6 +892,18 @@ async def submit_agent_input(
                     agent_tool_result = agent_response.get("tool_result") or agent_response.get(
                         "decision", {}
                     ).get("tool_result", {})
+                    request_elapsed_ms = round(
+                        (time.perf_counter() - request_started_at) * 1000,
+                        2,
+                    )
+                    agent_observability = dict(agent_response.get("observability") or {})
+                    agent_observability.update(
+                        {
+                            "request_id": request_id,
+                            "request_ms": request_elapsed_ms,
+                        }
+                    )
+                    agent_response["observability"] = agent_observability
                     assistant_text = (
                         agent_tool_result.get("answer")
                         or agent_tool_result.get("local_answer")
@@ -878,7 +953,16 @@ async def submit_agent_input(
                         "other_files": saved_other,
                         "tool_result": agent_tool_result,
                         "agent": agent_response,
+                        "observability": agent_observability,
                     }
+                    logger.info(
+                        "[agent.request] request_id=%s user=%s session=%s status=completed dispatched=%s request_ms=%.2f",
+                        request_id,
+                        safe_user_id,
+                        safe_session_id,
+                        dispatched,
+                        request_elapsed_ms,
+                    )
                     yield _sse_event("final", final_payload)
                     continue
 
@@ -887,9 +971,19 @@ async def submit_agent_input(
                 yield _sse_event(event_type, event_data)
         except Exception as exc:
             _set_tool_status("agent", "error", "Agent execution failed")
+            logger.exception(
+                "[agent.request] request_id=%s user=%s session=%s status=error detail=%s",
+                request_id,
+                safe_user_id,
+                safe_session_id,
+                exc,
+            )
             yield _sse_event(
                 "error",
-                {"message": str(exc) or "Agent execution failed."},
+                {
+                    "request_id": request_id,
+                    "message": str(exc) or "Agent execution failed.",
+                },
             )
         finally:
             _set_tool_status("local_llm", "idle", "Ready")

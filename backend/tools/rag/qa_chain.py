@@ -2,13 +2,17 @@ from __future__ import annotations
 
 from dataclasses import dataclass, replace
 from functools import lru_cache
+import logging
 from pathlib import Path
 import re
+import time
 
 from ...prompts import RAG_SYSTEM_PROMPT, build_rag_user_prompt
 from ..llm.client import get_local_qwen_client
 from .config import RAGConfig, get_config
 from .retrieval import HybridRetriever, RetrievedChunk
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(slots=True)
@@ -50,11 +54,14 @@ class LocalKnowledgeQAChain:
 
     def ask(self, query: str, min_score: float | None = None) -> dict:
         # Query -> Hybrid Retrieval -> Reranker -> Context Builder -> LLM
+        started_at = time.perf_counter()
+        retrieval_started_at = time.perf_counter()
         retrieved_chunks, retrieval_trace = self.retriever.hybrid_retrieve(query)
         (
             retrieved_chunks,
             ambiguity_trace,
         ) = self._refine_ambiguous_entity_query(query, retrieved_chunks)
+        retrieval_ms = round((time.perf_counter() - retrieval_started_at) * 1000, 2)
         if ambiguity_trace:
             retrieval_trace["ambiguity_resolution"] = ambiguity_trace
 
@@ -70,6 +77,18 @@ class LocalKnowledgeQAChain:
             )
 
         if not retrieved_chunks:
+            metrics = {
+                "retrieval_ms": retrieval_ms,
+                "generation_ms": 0.0,
+                "total_ms": round((time.perf_counter() - started_at) * 1000, 2),
+            }
+            logger.info(
+                "[rag] query=%r evidence=insufficient chunks=%s retrieval_ms=%.2f total_ms=%.2f",
+                query,
+                len(retrieved_chunks),
+                metrics["retrieval_ms"],
+                metrics["total_ms"],
+            )
             return {
                 "answer": "根据当前知识库内容无法确定。",
                 "message": "本地知识检索已执行，但未检索到达到当前置信度阈值的结果。",
@@ -77,11 +96,28 @@ class LocalKnowledgeQAChain:
                 "retrieved_chunks": [],
                 "retrieval_trace": retrieval_trace,
                 "evidence_status": "insufficient",
+                "metrics": metrics,
             }
 
         context = self.context_builder.build(retrieved_chunks)
+        generation_started_at = time.perf_counter()
         answer = self._generate_answer(query=query, context=context)
+        generation_ms = round((time.perf_counter() - generation_started_at) * 1000, 2)
         references = self._build_references(retrieved_chunks)
+        metrics = {
+            "retrieval_ms": retrieval_ms,
+            "generation_ms": generation_ms,
+            "total_ms": round((time.perf_counter() - started_at) * 1000, 2),
+        }
+        logger.info(
+            "[rag] query=%r evidence=sufficient chunks=%s references=%s retrieval_ms=%.2f generation_ms=%.2f total_ms=%.2f",
+            query,
+            len(retrieved_chunks),
+            len(references),
+            metrics["retrieval_ms"],
+            metrics["generation_ms"],
+            metrics["total_ms"],
+        )
         return {
             "answer": answer,
             "message": answer,
@@ -89,6 +125,7 @@ class LocalKnowledgeQAChain:
             "retrieved_chunks": [chunk.to_dict() for chunk in retrieved_chunks],
             "retrieval_trace": retrieval_trace,
             "evidence_status": "sufficient",
+            "metrics": metrics,
         }
 
     def _generate_answer(self, query: str, context: str) -> str:

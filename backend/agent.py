@@ -66,9 +66,9 @@ class AgentService:
 
     async def stream(self, agent_input: AgentInput) -> AsyncIterator[dict[str, Any]]:
         queue: asyncio.Queue[dict[str, Any] | None] = asyncio.Queue()
-        emitter_token = AGENT_EVENT_EMITTER.set(queue.put)
 
         async def _runner() -> None:
+            emitter_token = AGENT_EVENT_EMITTER.set(queue.put)
             try:
                 result, llm_traces = await invoke_graph_with_traces(
                     self.graph,
@@ -163,6 +163,7 @@ def _build_agent_response_payload(
         "agent_input": asdict(agent_input),
         "decision": asdict(decision),
         "tool_result": decision.tool_result,
+        "observability": decision.observability,
     }
 
 

@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import base64
 import json
+import logging
 from pathlib import Path
+import time
 from typing import Any
 
 from langchain_core.tools import BaseTool, tool
@@ -14,6 +16,23 @@ from .rag.config import get_config
 from .rag.qa_chain import get_shared_local_knowledge_qa_chain
 from .sc_analysis.skill import run_single_cell_skill
 from .web import run_web_search_query
+
+logger = logging.getLogger(__name__)
+
+_COMMON_TOOL_RESULT_KEYS = {
+    "tool_name",
+    "status",
+    "query",
+    "answer",
+    "message",
+    "local_answer",
+    "evidence_status",
+    "references",
+    "artifacts",
+    "metrics",
+    "meta",
+    "observation",
+}
 
 
 # 这些 runner 同时给 LangGraph 工作流和兼容的 LangChain tool wrapper 复用。
@@ -84,6 +103,7 @@ async def run_general_chat_with_memory(
     short_summary: str = "",
     profile: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
+    started_at = time.perf_counter()
     image_files = _load_general_chat_image_attachments(agent_input)
     pdf_contexts = _load_general_chat_pdf_context(agent_input)
     messages = build_general_chat_messages(
@@ -101,18 +121,40 @@ async def run_general_chat_with_memory(
         trace_label="general_chat_answer",
     )
     final_answer = str(local_result.get("message") or "").strip() or "模型未返回内容。"
-    return {
-        "status": "ok",
-        "query": agent_input.user_text,
-        "model": str(local_result.get("model_path") or "local_qwen"),
-        "answer": final_answer,
-        "message": final_answer,
-        "image_count": len(image_files),
-        "pdf_count": len(pdf_contexts),
-    }
+    result = _build_tool_result(
+        "general_chat",
+        status="ok",
+        query=agent_input.user_text,
+        answer=final_answer,
+        evidence_status="not_applicable",
+        metrics=_merge_metrics(
+            local_result.get("metrics"),
+            {"tool_ms": round((time.perf_counter() - started_at) * 1000, 2)},
+        ),
+        meta={
+            "model": str(local_result.get("model_path") or "local_qwen"),
+            "device": str(local_result.get("device") or ""),
+        },
+        observation={
+            "image_count": len(image_files),
+            "pdf_count": len(pdf_contexts),
+        },
+        model=str(local_result.get("model_path") or "local_qwen"),
+        image_count=len(image_files),
+        pdf_count=len(pdf_contexts),
+    )
+    logger.info(
+        "[tool.general_chat] session=%s images=%s pdfs=%s tool_ms=%.2f",
+        getattr(agent_input, "session_id", ""),
+        len(image_files),
+        len(pdf_contexts),
+        float(result.get("metrics", {}).get("tool_ms", 0.0)),
+    )
+    return result
 
 
 async def run_local_knowledge_qa(agent_input: Any) -> dict[str, Any]:
+    started_at = time.perf_counter()
     qa_chain = get_shared_local_knowledge_qa_chain(get_config())
     workspace_settings = dict(getattr(agent_input, "workspace_settings", {}) or {})
     try:
@@ -123,44 +165,196 @@ async def run_local_knowledge_qa(agent_input: Any) -> dict[str, Any]:
     except (TypeError, ValueError):
         min_score = 0.35
     result = qa_chain.ask(agent_input.user_text, min_score=min_score)
-    return {
-        "status": "ok",
-        "query": agent_input.user_text,
-        "answer": result.get("answer", ""),
-        "message": result.get("message", result.get("answer", "")),
-        "references": result.get("references", []),
-        "retrieved_chunks": result.get("retrieved_chunks", []),
-        "retrieval_trace": result.get("retrieval_trace"),
-        "evidence_status": result.get("evidence_status", ""),
-        "local_source_min_score": min_score,
-    }
+    canonical = _build_tool_result(
+        "local_knowledge_qa",
+        status="ok",
+        query=agent_input.user_text,
+        answer=str(result.get("answer") or ""),
+        message=str(result.get("message") or result.get("answer") or ""),
+        evidence_status=str(result.get("evidence_status") or "insufficient"),
+        references=result.get("references"),
+        metrics=_merge_metrics(
+            result.get("metrics"),
+            {"tool_ms": round((time.perf_counter() - started_at) * 1000, 2)},
+        ),
+        observation={
+            "retrieved_chunks": result.get("retrieved_chunks") or [],
+            "retrieval_trace": result.get("retrieval_trace") or {},
+            "local_source_min_score": min_score,
+        },
+        retrieved_chunks=result.get("retrieved_chunks", []),
+        retrieval_trace=result.get("retrieval_trace"),
+        local_source_min_score=min_score,
+    )
+    logger.info(
+        "[tool.local_knowledge_qa] session=%s evidence=%s refs=%s tool_ms=%.2f",
+        getattr(agent_input, "session_id", ""),
+        canonical.get("evidence_status", ""),
+        len(canonical.get("references") or []),
+        float(canonical.get("metrics", {}).get("tool_ms", 0.0)),
+    )
+    return canonical
 
 
 async def run_web_search(agent_input: Any) -> dict[str, Any]:
-    return await run_web_search_query(agent_input.user_text)
+    started_at = time.perf_counter()
+    raw_result = await run_web_search_query(agent_input.user_text)
+    references = raw_result.get("references") or []
+    evidence_status = "sufficient" if references else "insufficient"
+    if str(raw_result.get("status") or "").lower() in {"error", "unavailable"}:
+        evidence_status = "not_applicable"
+    canonical = _build_tool_result(
+        "web_search",
+        status=str(raw_result.get("status") or "ok"),
+        query=agent_input.user_text,
+        answer=str(raw_result.get("answer") or ""),
+        message=str(raw_result.get("message") or raw_result.get("answer") or ""),
+        evidence_status=evidence_status,
+        references=references,
+        metrics=_merge_metrics(
+            raw_result.get("metrics"),
+            {"tool_ms": round((time.perf_counter() - started_at) * 1000, 2)},
+        ),
+        meta={"provider": str(raw_result.get("provider") or "serper")},
+        observation={
+            "provider": raw_result.get("provider"),
+            "queries": raw_result.get("queries") or [],
+            "results": raw_result.get("results") or [],
+            "possible_answer": str(raw_result.get("possible_answer") or ""),
+        },
+        provider=raw_result.get("provider"),
+        queries=raw_result.get("queries"),
+        results=raw_result.get("results"),
+        possible_answer=raw_result.get("possible_answer"),
+    )
+    logger.info(
+        "[tool.web_search] session=%s status=%s refs=%s tool_ms=%.2f",
+        getattr(agent_input, "session_id", ""),
+        canonical.get("status", ""),
+        len(canonical.get("references") or []),
+        float(canonical.get("metrics", {}).get("tool_ms", 0.0)),
+    )
+    return canonical
 
 
 async def run_single_cell_analysis(agent_input: Any) -> dict[str, Any]:
+    started_at = time.perf_counter()
     h5ad_asset = next(
         (asset for asset in agent_input.attachments if asset.kind == "h5ad"),
         None,
     )
     if h5ad_asset is None:
-        return {
-            "status": "error",
-            "query": agent_input.user_text,
-            "message": "Single-cell analysis requires an h5ad attachment.",
-        }
+        return _build_tool_result(
+            "single_cell_analysis",
+            status="error",
+            query=agent_input.user_text,
+            message="Single-cell analysis requires an h5ad attachment.",
+            evidence_status="not_applicable",
+            metrics={"tool_ms": round((time.perf_counter() - started_at) * 1000, 2)},
+        )
 
     rag_config = get_config()
     h5ad_path = rag_config.project_root / h5ad_asset.path
 
-    return await run_single_cell_skill(
+    raw_result = await run_single_cell_skill(
         user_id=agent_input.user_id,
         session_id=agent_input.session_id,
         user_text=agent_input.user_text,
         h5ad_path=str(h5ad_path),
     )
+    canonical = _build_tool_result(
+        "single_cell_analysis",
+        status=str(raw_result.get("status") or "ok"),
+        query=agent_input.user_text,
+        answer=str(raw_result.get("answer") or ""),
+        message=str(raw_result.get("message") or raw_result.get("answer") or ""),
+        evidence_status=(
+            "sufficient"
+            if str(raw_result.get("status") or "").lower() in {"", "ok"}
+            else "not_applicable"
+        ),
+        references=raw_result.get("references"),
+        artifacts=raw_result.get("artifacts"),
+        metrics=_merge_metrics(
+            raw_result.get("metrics"),
+            {"tool_ms": round((time.perf_counter() - started_at) * 1000, 2)},
+        ),
+        observation=_extract_tool_observation(raw_result),
+        analysis_params=raw_result.get("analysis_params"),
+        analysis_result=raw_result.get("analysis_result"),
+        report_context=raw_result.get("report_context"),
+        pdf_report=raw_result.get("pdf_report"),
+        subset_test_cells=raw_result.get("subset_test_cells"),
+    )
+    logger.info(
+        "[tool.single_cell_analysis] session=%s status=%s artifacts=%s tool_ms=%.2f",
+        getattr(agent_input, "session_id", ""),
+        canonical.get("status", ""),
+        len(canonical.get("artifacts") or []),
+        float(canonical.get("metrics", {}).get("tool_ms", 0.0)),
+    )
+    return canonical
+
+
+def _build_tool_result(
+    tool_name: str,
+    *,
+    status: str,
+    query: str,
+    answer: str = "",
+    message: str = "",
+    evidence_status: str = "not_applicable",
+    references: list[dict[str, Any]] | None = None,
+    artifacts: list[dict[str, Any]] | None = None,
+    metrics: dict[str, Any] | None = None,
+    meta: dict[str, Any] | None = None,
+    observation: dict[str, Any] | None = None,
+    **extras: Any,
+) -> dict[str, Any]:
+    answer_text = str(answer or message or "").strip()
+    message_text = str(message or answer_text or "").strip()
+    payload: dict[str, Any] = {
+        "tool_name": tool_name,
+        "status": str(status or "ok"),
+        "query": str(query or ""),
+        "answer": answer_text,
+        "message": message_text,
+        "local_answer": answer_text or message_text,
+        "evidence_status": str(evidence_status or "not_applicable"),
+        "references": list(references or []),
+        "artifacts": list(artifacts or []),
+        "metrics": _merge_metrics(metrics),
+        "meta": dict(meta or {}),
+        "observation": dict(observation or {}),
+    }
+    for key, value in extras.items():
+        if value is None:
+            continue
+        payload[key] = value
+    return payload
+
+
+def _extract_tool_observation(raw_result: dict[str, Any]) -> dict[str, Any]:
+    observation = raw_result.get("observation")
+    merged = dict(observation) if isinstance(observation, dict) else {}
+    for key, value in raw_result.items():
+        if key in _COMMON_TOOL_RESULT_KEYS or value is None:
+            continue
+        merged[key] = value
+    return merged
+
+
+def _merge_metrics(*metric_maps: Any) -> dict[str, Any]:
+    merged: dict[str, Any] = {}
+    for metric_map in metric_maps:
+        if not isinstance(metric_map, dict):
+            continue
+        for key, value in metric_map.items():
+            if isinstance(value, (int, float)):
+                merged[key] = round(float(value), 2)
+            elif value is not None:
+                merged[key] = value
+    return merged
 
 
 def _json_tool_result(result: dict[str, Any]) -> str:

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from contextlib import contextmanager
+from threading import Lock, RLock
 from typing import Any
 
 from ..tools.rag.config import RAGConfig
@@ -10,29 +12,48 @@ from .storage import RedisShortTermStore, SQLiteLongTermStore
 class MemoryManager:
     """统一管理 Redis 短期记忆与 SQLite 长期记忆。"""
 
+    _session_lock_registry_guard = Lock()
+    _session_locks: dict[tuple[str, str], RLock] = {}
+
     def __init__(self, config: RAGConfig) -> None:
         self.config = config
         self.long_term_store = SQLiteLongTermStore(str(config.profile_storage_path))
         self.short_term_store = RedisShortTermStore()
         self._short_term_cache: dict[tuple[str, str], SessionMemory] = {}
 
-    def load_short_term(self, user_id: str, session_id: str) -> SessionMemory:
+    def _get_session_lock(self, user_id: str, session_id: str) -> RLock:
         cache_key = (user_id, session_id)
-        cached = self._short_term_cache.get(cache_key)
-        if cached is not None:
-            return cached
+        with self._session_lock_registry_guard:
+            lock = self._session_locks.get(cache_key)
+            if lock is None:
+                lock = RLock()
+                self._session_locks[cache_key] = lock
+            return lock
 
-        payload = self.short_term_store.load(user_id, session_id)
-        if payload is None:
-            memory = self._new_session_memory(session_id)
-        else:
-            memory = SessionMemory.from_dict(payload)
-            memory.max_messages = self.config.short_term_max_messages
-            memory.max_approx_tokens = self.config.short_term_max_approx_tokens
-            memory.summary_trigger_threshold = self.config.short_term_summary_threshold
+    @contextmanager
+    def _guard_session(self, user_id: str, session_id: str):
+        # 同一会话内的短期记忆读写必须串行，避免 cache 与 Redis 状态错位。
+        with self._get_session_lock(user_id, session_id):
+            yield
 
-        self._short_term_cache[cache_key] = memory
-        return memory
+    def load_short_term(self, user_id: str, session_id: str) -> SessionMemory:
+        with self._guard_session(user_id, session_id):
+            cache_key = (user_id, session_id)
+            cached = self._short_term_cache.get(cache_key)
+            if cached is not None:
+                return cached
+
+            payload = self.short_term_store.load(user_id, session_id)
+            if payload is None:
+                memory = self._new_session_memory(session_id)
+            else:
+                memory = SessionMemory.from_dict(payload)
+                memory.max_messages = self.config.short_term_max_messages
+                memory.max_approx_tokens = self.config.short_term_max_approx_tokens
+                memory.summary_trigger_threshold = self.config.short_term_summary_threshold
+
+            self._short_term_cache[cache_key] = memory
+            return memory
 
     def save_short_term(
         self,
@@ -40,9 +61,10 @@ class MemoryManager:
         session_id: str,
         memory: SessionMemory,
     ) -> None:
-        memory.summarize_if_needed()
-        self.short_term_store.save(user_id, session_id, memory.to_dict())
-        self._short_term_cache[(user_id, session_id)] = memory
+        with self._guard_session(user_id, session_id):
+            memory.summarize_if_needed()
+            self.short_term_store.save(user_id, session_id, memory.to_dict())
+            self._short_term_cache[(user_id, session_id)] = memory
 
     def write_short_term(
         self,
@@ -54,20 +76,22 @@ class MemoryManager:
         metadata: dict[str, Any] | None = None,
         state_update: dict[str, Any] | None = None,
     ) -> SessionMemory:
-        memory = self.load_short_term(user_id, session_id)
-        memory.append_message(role=role, content=content, metadata=metadata)
-        if state_update:
-            memory.update_state(state_update)
-        self.save_short_term(user_id, session_id, memory)
-        return memory
+        with self._guard_session(user_id, session_id):
+            memory = self.load_short_term(user_id, session_id)
+            memory.append_message(role=role, content=content, metadata=metadata)
+            if state_update:
+                memory.update_state(state_update)
+            self.save_short_term(user_id, session_id, memory)
+            return memory
 
     def read_short_term(self, user_id: str, session_id: str) -> SessionMemory:
         return self.load_short_term(user_id, session_id)
 
     def clear_short_term(self, user_id: str, session_id: str | None = None) -> int:
         if session_id:
-            self._short_term_cache.pop((user_id, session_id), None)
-            return self.short_term_store.delete(user_id, session_id)
+            with self._guard_session(user_id, session_id):
+                self._short_term_cache.pop((user_id, session_id), None)
+                return self.short_term_store.delete(user_id, session_id)
 
         cleared = self.short_term_store.delete_user(user_id)
         for cache_key in list(self._short_term_cache):
@@ -132,7 +156,14 @@ class MemoryManager:
         query: str,
         short_term: SessionMemory | None = None,
     ) -> BuiltMemoryContext:
-        short_term = short_term or self.load_short_term(user_id, session_id)
+        with self._guard_session(user_id, session_id):
+            effective_short_term = short_term or self.load_short_term(user_id, session_id)
+            recent_messages = effective_short_term.get_recent_messages(
+                self.config.short_term_max_messages
+            )
+            task_state = effective_short_term.get_state()
+            short_summary = effective_short_term.summary
+
         profile = (
             self.long_term_store.load_profile(user_id)
             if self.config.enable_profile_memory
@@ -148,11 +179,9 @@ class MemoryManager:
             session_id=session_id,
             profile=profile,
             semantic_memories=semantic_memories,
-            recent_messages=short_term.get_recent_messages(
-                self.config.short_term_max_messages
-            ),
-            task_state=short_term.get_state(),
-            short_summary=short_term.summary,
+            recent_messages=recent_messages,
+            task_state=task_state,
+            short_summary=short_summary,
         )
 
     def _new_session_memory(self, session_id: str) -> SessionMemory:

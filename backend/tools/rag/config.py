@@ -48,9 +48,7 @@ def get_config() -> RAGConfig:
     embedding_model_path = Path(
         os.getenv("EMBEDDING_MODEL_PATH", str(models_dir / "bge-m3"))
     )
-    default_llm_model_path = Path(
-        "./agent/models/Qwen2.5-VL-7B-Instruct"
-    )
+    default_llm_model_path = models_dir / "Qwen2.5-VL-7B-Instruct"
     llm_model_path = Path(
         os.getenv("LLM_MODEL_PATH", str(default_llm_model_path))
     ).expanduser()

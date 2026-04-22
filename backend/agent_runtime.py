@@ -7,6 +7,8 @@ from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from enum import StrEnum
 import json
+import logging
+import time
 from typing import Any, AsyncIterator, Awaitable, Callable, TypedDict
 
 from .memory import BuiltMemoryContext, MemoryManager, SemanticMemoryHit
@@ -83,6 +85,7 @@ class AgentDecision:
     execution_steps: list[AgentStep] = field(default_factory=list)
     tool_result: dict[str, Any] = field(default_factory=dict)
     llm_traces: list[dict[str, Any]] = field(default_factory=list)
+    observability: dict[str, Any] = field(default_factory=dict)
 
 
 class AgentWorkflowState(TypedDict, total=False):
@@ -152,6 +155,7 @@ DEFAULT_ROUTE_REASON = "已根据问题内容自动完成处理。"
 DEFAULT_EMPTY_ANSWER = "模型未返回内容。"
 
 _MEMORY_MANAGER = MemoryManager(get_config())
+logger = logging.getLogger(__name__)
 AGENT_EVENT_EMITTER: ContextVar[
     Callable[[dict[str, Any]], Awaitable[None]] | None
 ] = ContextVar("agent_event_emitter", default=None)
@@ -185,6 +189,7 @@ class AgentRuntime:
             ),
             tool_result=tool_result,
             llm_traces=llm_traces,
+            observability=dict(result.get("observability") or {}),
         )
 
     def make_tool_node(
@@ -347,6 +352,7 @@ class AgentRuntime:
         state: AgentWorkflowState,
         tool_name: str,
     ) -> AgentWorkflowState:
+        started_at = time.perf_counter()
         agent_input = _build_effective_agent_input(
             _deserialize_agent_input(state["agent_input"]),
             str(state.get("resolved_user_text") or ""),
@@ -384,7 +390,17 @@ class AgentRuntime:
                 "label": _display_executable_tool_name(tool_name),
                 "status": str(result.get("status") or ""),
                 "summary": _summarize_single_tool_result(result),
+                "metrics": result.get("metrics") or {},
             },
+        )
+        logger.info(
+            "[agent.tool] user=%s session=%s tool=%s status=%s tool_ms=%.2f node_ms=%.2f",
+            agent_input.user_id,
+            agent_input.session_id,
+            tool_name,
+            str(result.get("status") or ""),
+            float((result.get("metrics") or {}).get("tool_ms", 0.0)),
+            round((time.perf_counter() - started_at) * 1000, 2),
         )
         return {
             "selected_tool_names": _append_tool_name(
@@ -402,6 +418,7 @@ class AgentRuntime:
     async def finalize_node(
         self, state: AgentWorkflowState
     ) -> AgentWorkflowState:
+        started_at = time.perf_counter()
         agent_input = _deserialize_agent_input(state["agent_input"])
         raw_tool_results = state.get("raw_tool_results") or {}
         single_cell_result = dict(raw_tool_results.get("single_cell_analysis") or {})
@@ -486,6 +503,17 @@ class AgentRuntime:
             tool_result=normalized_result,
             final_answer=final_answer,
         )
+        metrics = dict(normalized_result.get("metrics") or {})
+        metrics["finalize_ms"] = round((time.perf_counter() - started_at) * 1000, 2)
+        normalized_result["metrics"] = metrics
+        logger.info(
+            "[agent.finalize] user=%s session=%s intent=%s status=%s finalize_ms=%.2f",
+            agent_input.user_id,
+            agent_input.session_id,
+            intent.value,
+            str(normalized_result.get("status") or ""),
+            float(metrics.get("finalize_ms", 0.0)),
+        )
         return {
             "tool_result": normalized_result,
             "final_answer": final_answer,
@@ -513,6 +541,7 @@ def deserialize_agent_input(payload: dict[str, Any]) -> AgentInput:
 
 async def invoke_graph_with_traces(graph: Any, agent_input: AgentInput) -> tuple[dict[str, Any], list[dict[str, Any]]]:
     trace_token = begin_llm_trace_session()
+    started_at = time.perf_counter()
     try:
         result = await graph.ainvoke(
             {"agent_input": _serialize_agent_input(agent_input)},
@@ -525,6 +554,16 @@ async def invoke_graph_with_traces(graph: Any, agent_input: AgentInput) -> tuple
         )
     finally:
         llm_traces = end_llm_trace_session(trace_token)
+    if isinstance(result, dict):
+        observability = dict(result.get("observability") or {})
+        observability["graph_ms"] = round((time.perf_counter() - started_at) * 1000, 2)
+        result["observability"] = observability
+        logger.info(
+            "[agent.graph] user=%s session=%s graph_ms=%.2f",
+            agent_input.user_id,
+            agent_input.session_id,
+            float(observability.get("graph_ms", 0.0)),
+        )
     return result, llm_traces
 
 
@@ -548,6 +587,7 @@ async def _run_route_decision(
     transcript: str,
     attachment_lines: list[str],
 ) -> dict[str, Any]:
+    started_at = time.perf_counter()
     tool_lines = _build_tool_lines()
     messages = build_react_deliberation_messages(
         user_text=user_text,
@@ -563,6 +603,13 @@ async def _run_route_decision(
     )
     decision = _parse_route_decision(raw_output.get("message") or "")
     if decision is not None:
+        logger.info(
+            "[agent.route] action=%s tool=%s intent=%s elapsed_ms=%.2f",
+            decision.get("action", ""),
+            decision.get("tool_name", ""),
+            decision.get("intent", ""),
+            round((time.perf_counter() - started_at) * 1000, 2),
+        )
         return decision
 
     repair_messages = build_react_decision_repair_messages(
@@ -580,7 +627,18 @@ async def _run_route_decision(
     )
     repaired = _parse_route_decision(repaired_output.get("message") or "")
     if repaired is not None:
+        logger.info(
+            "[agent.route] action=%s tool=%s intent=%s repaired=true elapsed_ms=%.2f",
+            repaired.get("action", ""),
+            repaired.get("tool_name", ""),
+            repaired.get("intent", ""),
+            round((time.perf_counter() - started_at) * 1000, 2),
+        )
         return repaired
+    logger.warning(
+        "[agent.route] fallback=general_chat elapsed_ms=%.2f",
+        round((time.perf_counter() - started_at) * 1000, 2),
+    )
     return {
         "intent": IntentType.GENERAL_CHAT.value,
         "plan": "路由结果解析失败，回退到直接对话。",
@@ -1070,16 +1128,35 @@ def _filter_web_result_by_score(
     filtered["results"] = filtered_results
     filtered["references"] = filtered_references
     filtered["web_source_min_score"] = min_score
+    filtered["raw_results_count"] = len(raw_results)
+    filtered["retained_results_count"] = len(filtered_results)
     filtered["filtered_out_count"] = max(0, len(raw_results) - len(filtered_results))
+    observation = dict(filtered.get("observation") or {})
+    observation["results"] = filtered_results
+    observation["web_source_min_score"] = min_score
+    observation["raw_results_count"] = len(raw_results)
+    observation["retained_results_count"] = len(filtered_results)
+    observation["filtered_out_count"] = filtered["filtered_out_count"]
+    filtered["observation"] = observation
+    status = str(filtered.get("status") or "").strip().lower()
+    if status not in {"", "ok"}:
+        return filtered
 
     if filtered_results:
         possible_answer = _build_web_possible_answer(filtered_results)
         filtered["possible_answer"] = possible_answer
         filtered["answer"] = possible_answer
         filtered["local_answer"] = possible_answer
+        filtered["message"] = possible_answer
         filtered["evidence_status"] = "sufficient"
     else:
-        message = "网页搜索已执行，但未检索到达到当前置信度阈值的结果。"
+        if raw_results:
+            message = (
+                "网页搜索已执行，并返回了候选结果，"
+                f"但在当前阈值（score >= {min_score:.2f}）下均未保留。"
+            )
+        else:
+            message = "网页搜索已执行，但未返回可用候选结果。"
         filtered["possible_answer"] = ""
         filtered["answer"] = message
         filtered["local_answer"] = message
@@ -1127,11 +1204,17 @@ def _summarize_single_tool_result(result: dict[str, Any]) -> str:
 
 
 def _compact_tool_result(result: dict[str, Any]) -> dict[str, Any]:
-    compact: dict[str, Any] = {"status": str(result.get("status") or "")}
+    compact: dict[str, Any] = {
+        "tool_name": str(result.get("tool_name") or ""),
+        "status": str(result.get("status") or ""),
+    }
     for key in ("query", "answer", "message", "local_answer", "report_context"):
         value = str(result.get(key) or "").strip()
         if value:
             compact[key] = _trim_text(value, 240)
+    evidence_status = str(result.get("evidence_status") or "").strip()
+    if evidence_status:
+        compact["evidence_status"] = evidence_status
 
     references = result.get("references")
     if isinstance(references, list) and references:
@@ -1144,6 +1227,14 @@ def _compact_tool_result(result: dict[str, Any]) -> dict[str, Any]:
     analysis_result = result.get("analysis_result")
     if isinstance(analysis_result, dict) and analysis_result:
         compact["analysis_result_keys"] = list(analysis_result.keys())[:12]
+
+    metrics = result.get("metrics")
+    if isinstance(metrics, dict) and metrics:
+        compact["metrics"] = {
+            key: value
+            for key, value in metrics.items()
+            if isinstance(value, (int, float))
+        }
 
     return compact
 
@@ -1573,18 +1664,31 @@ def _combine_external_knowledge_results(
     rag_result: dict[str, Any],
     web_result: dict[str, Any],
 ) -> dict[str, Any]:
+    references = _merge_references(
+        rag_result.get("references"),
+        web_result.get("references"),
+    )
     combined: dict[str, Any] = {
+        "tool_name": "knowledge_fusion",
         "status": "ok",
+        "query": str(rag_result.get("query") or web_result.get("query") or ""),
+        "message": str(web_result.get("message") or rag_result.get("message") or ""),
+        "local_answer": str(web_result.get("local_answer") or rag_result.get("local_answer") or ""),
+        "evidence_status": "sufficient" if references else "insufficient",
         "local_knowledge_qa": rag_result,
         "web_search": web_result,
         "observation": {
             "local_knowledge_qa": rag_result,
             "web_search": web_result,
         },
-        "references": _merge_references(
-            rag_result.get("references"),
-            web_result.get("references"),
+        "references": references,
+        "artifacts": [],
+        "metrics": _merge_metric_dicts(
+            rag_result.get("metrics"),
+            web_result.get("metrics"),
+            prefixes={"local_knowledge_qa": rag_result.get("metrics"), "web_search": web_result.get("metrics")},
         ),
+        "meta": {},
     }
     if rag_result.get("retrieved_chunks"):
         combined["retrieved_chunks"] = rag_result.get("retrieved_chunks")
@@ -1597,23 +1701,64 @@ def _normalize_tool_result(
     raw_tool_result: dict[str, Any],
     final_answer: str,
 ) -> dict[str, Any]:
+    if not raw_tool_result:
+        default_answer = final_answer or DEFAULT_EMPTY_ANSWER
+        return {
+            "tool_name": "finalize",
+            "status": "ok",
+            "query": "",
+            "answer": default_answer,
+            "message": default_answer,
+            "local_answer": default_answer,
+            "evidence_status": "not_applicable",
+            "references": [],
+            "artifacts": [],
+            "metrics": {},
+            "meta": {},
+            "observation": {},
+        }
     tool_result = dict(raw_tool_result)
+    tool_result["tool_name"] = str(tool_result.get("tool_name") or "finalize")
+    tool_result["status"] = str(tool_result.get("status") or "ok")
+    tool_result["query"] = str(tool_result.get("query") or "")
+    tool_result["references"] = list(tool_result.get("references") or [])
+    tool_result["artifacts"] = list(tool_result.get("artifacts") or [])
+    tool_result["metrics"] = _merge_metric_dicts(tool_result.get("metrics"))
+    tool_result["meta"] = dict(tool_result.get("meta") or {})
+    tool_result["observation"] = dict(tool_result.get("observation") or {})
+    tool_result["evidence_status"] = str(
+        tool_result.get("evidence_status")
+        or ("sufficient" if tool_result["references"] else "not_applicable")
+    )
     if final_answer:
         if raw_tool_result and "observation" not in tool_result:
             tool_result["observation"] = dict(raw_tool_result)
         tool_result["answer"] = final_answer
         tool_result["message"] = final_answer
         tool_result["local_answer"] = final_answer
-    if tool_result and not tool_result.get("status"):
-        tool_result["status"] = "ok"
-    if not tool_result:
-        tool_result = {
-            "status": "ok",
-            "answer": final_answer or DEFAULT_EMPTY_ANSWER,
-            "message": final_answer or DEFAULT_EMPTY_ANSWER,
-            "local_answer": final_answer or DEFAULT_EMPTY_ANSWER,
-        }
     return tool_result
+
+
+def _merge_metric_dicts(
+    *metric_groups: Any,
+    prefixes: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    merged: dict[str, Any] = {}
+    for group in metric_groups:
+        if not isinstance(group, dict):
+            continue
+        for key, value in group.items():
+            if isinstance(value, (int, float)):
+                merged[key] = round(float(value), 2)
+            elif value is not None:
+                merged[key] = value
+    for prefix, group in (prefixes or {}).items():
+        if not isinstance(group, dict):
+            continue
+        for key, value in group.items():
+            if isinstance(value, (int, float)):
+                merged[f"{prefix}_{key}"] = round(float(value), 2)
+    return merged
 
 
 def _resolve_selected_tools(
