@@ -23,3 +23,6 @@ logs/
 # IDE
 .vscode/
 .idea/
+
+.ipynb_checkpoints/
+.env.example
