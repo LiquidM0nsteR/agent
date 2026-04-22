@@ -1,0 +1,198 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>智能体对话</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      href="https://fonts.googleapis.com/css2?family=Manrope:wght@400;500;700;800&family=Noto+Sans+SC:wght@400;500;700&display=swap"
+      rel="stylesheet"
+    />
+    <link rel="stylesheet" href="/assets/styles.css?v=chatgpt-11" />
+  </head>
+  <body>
+    <div id="auth-gate" class="auth-gate">
+      <div class="auth-card">
+        <p class="auth-eyebrow">智能体工作台</p>
+        <h1 class="auth-title">登录后开始对话</h1>
+        <p class="auth-copy">
+          输入一个用户名即可进入工作区。当前版本使用轻量本地登录，用于区分用户和会话。
+        </p>
+        <form id="login-form" class="auth-form">
+          <label class="auth-label" for="login-user-id">用户名</label>
+          <input
+            id="login-user-id"
+            class="auth-input"
+            type="text"
+            placeholder="例如 xzy 或 analyst_01"
+            autocomplete="username"
+          />
+          <button id="login-button" type="submit">进入工作区</button>
+        </form>
+      </div>
+    </div>
+
+    <main id="workspace-shell" class="workspace-shell is-hidden">
+      <aside class="sidebar">
+        <div class="sidebar-head">
+          <div>
+            <p class="sidebar-eyebrow">当前用户</p>
+            <h2 id="active-user-label" class="sidebar-user">anonymous</h2>
+          </div>
+          <button id="logout-button" class="ghost-button" type="button">退出</button>
+        </div>
+
+        <button id="new-chat-button" class="new-chat-button" type="button">+ 新建对话</button>
+
+        <section class="session-section">
+          <div class="session-section-head">
+            <span>会话列表</span>
+            <span id="session-count" class="session-count">0</span>
+          </div>
+          <div id="session-list" class="session-list"></div>
+        </section>
+
+        <section class="sidebar-tools">
+          <p class="sidebar-tools-title">工作台扩展</p>
+          <div class="sidebar-tools-grid">
+            <button id="workspace-settings-button" class="sidebar-tool" type="button">设置</button>
+            <button id="workspace-knowledge-button" class="sidebar-tool" type="button">知识库</button>
+            <button id="workspace-tools-button" class="sidebar-tool" type="button">工具状态</button>
+          </div>
+        </section>
+      </aside>
+
+      <section class="chat-shell">
+        <header class="chat-header">
+          <div>
+            <p class="chat-header-eyebrow">会话</p>
+            <h1 id="active-session-label" class="chat-header-title">新对话</h1>
+          </div>
+          <div class="chat-header-meta">
+            <span class="chat-status">就绪</span>
+            <span id="active-session-id" class="session-pill">未创建</span>
+          </div>
+        </header>
+
+        <section id="result-panel" class="result-panel">
+          <div id="chat-empty" class="chat-empty">
+            <div class="chat-empty-content">
+              <p class="chat-empty-title">今天想先做什么？</p>
+              <p class="chat-empty-copy">
+                可以直接提问，或从下面的快捷入口开始。首条消息会自动创建新的 session。
+              </p>
+              <div class="quick-actions">
+                <button class="quick-card" type="button" data-quick-prompt="帮我解释一个生物信息学中的概念，并给出一个简单例子。">
+                  解释一个问题
+                </button>
+                <button class="quick-card" type="button" data-quick-prompt="帮我检索近期与单细胞分析相关的论文，并总结关键观点。">
+                  搜索资料
+                </button>
+                <button class="quick-card" type="button" data-quick-prompt="我会上传一个 h5ad 文件，请先做单细胞分析并给出摘要。">
+                  上传文件分析
+                </button>
+                <button class="quick-card" type="button" data-quick-prompt="请给我一个后续实验设计建议，包含可执行步骤。">
+                  生成行动建议
+                </button>
+              </div>
+            </div>
+          </div>
+          <div id="chat-thread" class="chat-thread"></div>
+        </section>
+
+        <form id="agent-form" class="agent-form">
+          <div class="composer-card" id="composer-card">
+            <div class="composer-inner">
+              <textarea
+                id="text"
+                name="text"
+                rows="1"
+                placeholder="输入消息，或描述你想执行的分析任务"
+              ></textarea>
+
+              <div class="composer-actions">
+                <label class="attach-button" for="files">上传图片 / PDF / h5ad</label>
+                <input
+                  id="files"
+                  name="files"
+                  type="file"
+                  multiple
+                  accept=".png,.jpg,.jpeg,.webp,.gif,.bmp,.pdf,.h5ad,image/*,application/pdf"
+                />
+                <button id="submit-button" type="submit">发送</button>
+              </div>
+            </div>
+
+            <section id="selected-files" class="selected-files is-collapsed">
+              <div class="selected-head">
+                <strong>附件</strong>
+                <span id="file-count" class="file-count">0 files</span>
+              </div>
+              <ul id="file-list" class="file-list">
+                <li>未选择文件</li>
+              </ul>
+            </section>
+          </div>
+        </form>
+      </section>
+    </main>
+
+    <div id="source-overlay" class="source-overlay is-hidden"></div>
+    <aside id="source-drawer" class="source-drawer" aria-label="来源详情">
+      <div class="source-drawer-head">
+        <div>
+          <p class="source-drawer-eyebrow">来源详情</p>
+          <p id="source-summary" class="source-drawer-summary">
+            选择一条回复查看支撑材料。
+          </p>
+        </div>
+        <button id="source-close" class="source-close" type="button">关闭</button>
+      </div>
+
+      <div class="source-tabs">
+        <button class="source-tab is-active" type="button" data-source-tab="local">
+          本地
+        </button>
+        <button class="source-tab" type="button" data-source-tab="web">
+          网页
+        </button>
+      </div>
+
+      <div class="source-drawer-body">
+        <div id="source-local-panel" class="source-panel"></div>
+        <div id="source-web-panel" class="source-panel is-hidden"></div>
+      </div>
+    </aside>
+
+    <div id="workspace-overlay" class="source-overlay is-hidden"></div>
+    <aside id="workspace-drawer" class="source-drawer workspace-drawer" aria-label="工作台工具">
+      <div class="source-drawer-head">
+        <div>
+          <p class="source-drawer-eyebrow">工作台</p>
+          <p id="workspace-summary" class="source-drawer-summary">
+            管理常用设置、知识库文件和工具运行状态。
+          </p>
+        </div>
+        <button id="workspace-close" class="source-close" type="button">关闭</button>
+      </div>
+
+      <div class="source-tabs">
+        <button class="source-tab is-active" type="button" data-workspace-tab="settings">
+          设置
+        </button>
+        <button class="source-tab" type="button" data-workspace-tab="knowledge">知识库</button>
+        <button class="source-tab" type="button" data-workspace-tab="tools">工具状态</button>
+      </div>
+
+      <div class="source-drawer-body">
+        <div id="workspace-settings-panel" class="source-panel"></div>
+        <div id="workspace-knowledge-panel" class="source-panel is-hidden"></div>
+        <div id="workspace-tools-panel" class="source-panel is-hidden"></div>
+      </div>
+    </aside>
+
+    <script src="/assets/app.js?v=chatgpt-11" defer></script>
+  </body>
+</html>

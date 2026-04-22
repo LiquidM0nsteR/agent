@@ -1,0 +1,25 @@
+# Python
+__pycache__/
+*.pyc
+
+# 模型权重
+models/
+*.pt
+*.bin
+
+# 数据
+data/
+*.h5ad
+
+# 环境
+.env
+.venv/
+conda-meta/
+
+# 日志
+logs/
+*.log
+
+# IDE
+.vscode/
+.idea/
