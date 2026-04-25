@@ -2,16 +2,14 @@
 
 本项目当前包含：
 - FastAPI 后端入口：`backend/main.py`
-- LangGraph 工作流图：`backend/agent.py`
-- LangGraph 节点与运行时实现：`backend/agent_runtime.py`
+- LangGraph Agent：`backend/agent.py`
 - 本地 RAG、网页搜索、单细胞分析、多模态问答工具链
 - 登录、会话管理、长短期记忆与前端工作台
 
 ## 1. 目录说明
 
 - `backend/main.py`：API 入口、SSE 流式输出、会话与工作台接口。
-- `backend/agent.py`：只保留 LangGraph 的 state graph 结构和对外入口。
-- `backend/agent_runtime.py`：节点逻辑、ReAct 路由、工具执行、finalize 与记忆写回。
+- `backend/agent.py`：LangGraph 图结构、节点逻辑、ReAct 路由、工具执行、finalize 与记忆写回。
 - `backend/tools/`：LLM、RAG、Web Search、单细胞分析工具。
 - `backend/memory/`：Redis 短期记忆 + SQLite 长期记忆。
 - `build_index.py`：重建本地知识库 BM25 + Qdrant 索引。
@@ -97,7 +95,7 @@ data/users/<user_id>/sessions/<session_id>/
 ## 7. 最小校验
 
 ```bash
-python -m py_compile backend/main.py backend/agent.py backend/agent_runtime.py
+python -m py_compile backend/main.py backend/agent.py
 ```
 
 然后至少手工验证：
