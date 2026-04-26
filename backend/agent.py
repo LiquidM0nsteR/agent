@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import operator
 import os
 import time
@@ -27,11 +28,10 @@ from .util import (
     infer_input_kind_by_files,
     get_h5ad_files,
     get_rag_files,
-    latest_observation,
     parse_router_output,
 )
 from .memory import get_memory_manager
-from .prompts import build_supervisor_prompt, build_final_prompt
+from .prompts import build_final_prompt, build_react_prompt
 
 
 Intent = Literal["rag", "web_search", "sc_analysis", "chat", "unknown"]
@@ -74,6 +74,8 @@ class AgentState(TypedDict, total=False):
     input_kind: InputKind
     intent: Intent
     next_node: NextNode
+    current_action: NextNode
+    current_action_input: dict[str, Any]
 
     uploaded_files: list[str]
     normalized_files: list[UploadedFileInfo]
@@ -90,6 +92,7 @@ class AgentState(TypedDict, total=False):
     current_tool_results: dict[str, Any]
     current_tool_results_turn_id: str
     llm_traces: Annotated[list[dict[str, Any]], operator.add]
+    react_steps: Annotated[list[dict[str, Any]], operator.add]
     memory_context: str
     long_term_memories: list[dict[str, Any]]
 
@@ -157,8 +160,8 @@ def _call_router_llm_streaming(prompt: str) -> str:
             "node": "SupervisorNode",
             "status": "thought",
             "kind": "router_start",
-            "action": "调用 LLM Router",
-            "plan": "判断当前输入应该进入本地知识库、网页搜索、单细胞分析或直接回答。",
+            "action": "调用 ReAct Supervisor",
+            "plan": "基于用户输入和已有工具观察，输出下一步 Thought / Action / Action Input。",
         }
     )
     chunks: list[str] = []
@@ -278,13 +281,6 @@ def _rag_confidence_from_result(result: Any) -> float:
     return max(scores, default=0.0)
 
 
-def _rag_evidence_is_sufficient(state: AgentState, observation: dict[str, Any]) -> bool:
-    metadata = dict(observation.get("metadata") or {})
-    confidence = float(metadata.get("confidence") or 0.0)
-    threshold = float(metadata.get("confidence_threshold") or _rag_confidence_threshold(state))
-    return confidence >= threshold
-
-
 def _format_web_search_content(result: Any) -> str:
     if not isinstance(result, dict):
         return safe_text(result)
@@ -330,20 +326,6 @@ def _normalize_rag_files_for_base(files: list[str], knowledge_base_path: str) ->
         except ValueError:
             normalized.append(str(resolved))
     return normalized
-
-
-def _rag_index_missing(index_dir: str) -> bool:
-    if not index_dir:
-        return True
-    root = Path(index_dir).expanduser()
-    return not all((root / item).exists() for item in ("chunks.jsonl", "bm25.pkl", "qdrant"))
-
-
-def _uses_session_knowledge_base(knowledge_base_path: str) -> bool:
-    try:
-        return Path(knowledge_base_path).expanduser().resolve() != Path(KNOWLEDGE_BASE_PATH).expanduser().resolve()
-    except Exception:
-        return True
 
 
 def _elapsed_ms(started_at: float) -> float:
@@ -401,6 +383,12 @@ def _current_turn_tool_results(state: AgentState) -> dict[str, Any]:
     return dict(state.get("tool_results") or {})
 
 
+def _action_query(state: AgentState) -> str:
+    action_input = state.get("current_action_input")
+    query = str((action_input if isinstance(action_input, dict) else {}).get("query") or "").strip()
+    return query or last_user_text(state)
+
+
 def _tool_name_for_step(node: str) -> str:
     return STEP_TOOL_NAME_MAP.get(node, "")
 
@@ -424,12 +412,6 @@ def _build_step_record(
     if turn_id:
         record["turn_id"] = turn_id
     return record
-
-
-def _build_route_result(next_node: str) -> tuple[str, str]:
-    label = ROUTE_RESULT_LABEL_MAP.get(next_node, next_node or "未知节点")
-    tool_name = _tool_name_for_step(next_node)
-    return tool_name, f"路由结果：{label}"
 
 
 def _tool_node_result(
@@ -535,6 +517,9 @@ def _build_initial_state(
         "tool_results": {},
         "current_tool_results": {},
         "current_tool_results_turn_id": "",
+        "current_action": "FinalNode",
+        "current_action_input": {},
+        "react_steps": [],
         "memory_context": "",
         "long_term_memories": [],
         "steps": [],
@@ -577,36 +562,126 @@ def _store_turn(
     )
 
 
-def _llm_route_for_text_only(state: AgentState) -> tuple[NextNode, dict[str, Any]]:
-    """
-    纯文本输入时，允许使用 LLM Router 判断下一步。
-    不再使用关键词匹配。
-    """
-    user_input = last_user_text(state)
+def _input_metadata_for_state(state: AgentState) -> dict[str, Any]:
+    uploaded_files = list(state.get("uploaded_files") or [])
+    normalized_files = list(state.get("normalized_files") or [])
+    if uploaded_files and not normalized_files:
+        normalized_files = normalize_uploaded_files(
+            uploaded_files,
+            upload_workdir=state.get("upload_workdir", ""),
+        )
 
-    prompt = build_supervisor_prompt(
-        user_input=user_input,
-        observations=_current_turn_observations(state),
+    input_kind = str(state.get("input_kind") or "")
+    if not input_kind:
+        input_kind = infer_input_kind_by_files(
+            normalized_files=normalized_files,
+            user_input=last_user_text(state),
+        )
+
+    h5ad_files = list(state.get("h5ad_files") or [])
+    if normalized_files and not h5ad_files:
+        h5ad_files = get_h5ad_files(normalized_files)
+
+    rag_files = list(state.get("rag_files") or [])
+    if normalized_files and not rag_files:
+        rag_files = get_rag_files(normalized_files)
+
+    return {
+        "uploaded_files": uploaded_files,
+        "normalized_files": normalized_files,
+        "input_kind": input_kind or "unknown",
+        "h5ad_files": h5ad_files,
+        "rag_files": rag_files,
+    }
+
+
+def _parse_react_decision(router_output: str) -> dict[str, Any]:
+    try:
+        raw = str(router_output or "").strip()
+        if raw.startswith("```"):
+            raw = raw.strip("`").strip()
+            if raw.lower().startswith("json"):
+                raw = raw[4:].strip()
+        start = raw.find("{")
+        end = raw.rfind("}")
+        if start >= 0 and end > start:
+            raw = raw[start : end + 1]
+        payload = json.loads(raw)
+        if not isinstance(payload, dict):
+            raise ValueError("ReAct Supervisor 输出不是 JSON object。")
+    except Exception:
+        action = parse_router_output(router_output)
+        payload = {"thought": str(router_output).strip(), "action": action, "action_input": {}}
+
+    action = str(payload.get("action") or payload.get("next_node") or "").strip()
+    if action not in {"RAG", "WebSearch", "scAnalysis", "FinalNode"}:
+        action = "FinalNode"
+
+    action_input = payload.get("action_input")
+    if not isinstance(action_input, dict):
+        action_input = {}
+    query = str(action_input.get("query") or "").strip()
+    action_input = {**action_input, "query": query}
+
+    return {
+        "thought": str(payload.get("thought") or payload.get("reason") or "").strip(),
+        "action": action,
+        "action_input": action_input,
+        "finish": bool(payload.get("finish") or action == "FinalNode"),
+    }
+
+
+def _llm_react_decision(
+    state: AgentState,
+    metadata: dict[str, Any],
+) -> tuple[NextNode, dict[str, Any], dict[str, Any]]:
+    prompt = build_react_prompt(
+        user_input=last_user_text(state),
+        metadata=metadata,
         steps=_current_turn_steps(state),
+        react_steps=[
+            item
+            for item in list(state.get("react_steps") or [])
+            if isinstance(item, dict) and _is_current_turn_item(state, item)
+        ],
+        observations=_current_turn_observations(state),
+        tool_results=_current_turn_tool_results(state),
         memory_context=str(state.get("memory_context") or ""),
     )
-
     started_at = time.perf_counter()
     router_output = _call_router_llm_streaming(prompt)
     elapsed_ms = _elapsed_ms(started_at)
+    decision = _parse_react_decision(router_output)
+    next_node = str(decision.get("action") or "FinalNode")
+    action_input = dict(decision.get("action_input") or {})
+    adjusted = False
+    reason = str(decision.get("thought") or "").strip()
 
-    next_node = parse_router_output(router_output)
+    if next_node == "scAnalysis" and not metadata.get("h5ad_files"):
+        next_node = "FinalNode"
+        adjusted = True
+        reason = "ReAct 选择了 scAnalysis，但当前没有 h5ad 文件，因此结束工具调用。"
+    elif next_node not in {"RAG", "WebSearch", "scAnalysis", "FinalNode"}:
+        next_node = "FinalNode"
+        adjusted = True
+        reason = "ReAct 输出了未知 Action，因此结束工具调用。"
 
-    if next_node in {"RAG", "WebSearch", "FinalNode"}:
-        parsed_node = next_node
-    else:
-        parsed_node = "FinalNode"
+    thought = reason or str(decision.get("thought") or "").strip()
 
     trace = {
-        "label": "Supervisor Router",
+        "label": "ReAct Supervisor",
         "response": router_output,
-        "parsed_node": parsed_node,
+        "parsed_node": next_node,
+        "thought": thought,
+        "action_input": action_input,
         "elapsed_ms": elapsed_ms,
+        "turn_id": _current_turn_id(state),
+    }
+    react_step = {
+        "thought": thought,
+        "action": next_node,
+        "action_input": action_input,
+        "observation_count": len(_current_turn_observations(state)),
         "turn_id": _current_turn_id(state),
     }
     emit(
@@ -615,11 +690,15 @@ def _llm_route_for_text_only(state: AgentState) -> tuple[NextNode, dict[str, Any
             "status": "thought",
             "kind": "router_decision",
             "content": router_output,
-            "next_node": parsed_node,
-            "reason": f"LLM Router 输出 {router_output!r}，解析为 {parsed_node}。",
+            "thought": thought,
+            "action": next_node,
+            "next_node": next_node,
+            "action_input": action_input,
+            "reason": thought,
+            "adjusted": adjusted,
         }
     )
-    return parsed_node, trace  # type: ignore[return-value]
+    return next_node, trace, react_step  # type: ignore[return-value]
 
 
 # =========================
@@ -628,220 +707,87 @@ def _llm_route_for_text_only(state: AgentState) -> tuple[NextNode, dict[str, Any
 
 def supervisor_node(state: AgentState) -> dict[str, Any]:
     """
-    SupervisorNode 新规则：
-
-    1. 不使用字符串关键词匹配。
-    2. 文件形态优先：
-       - 有 h5ad -> scAnalysis
-       - 有 pdf / md / txt / 代码转 md -> RAG
-    3. 纯文本输入：
-       - 使用 LLM Router 判断 RAG / WebSearch / FinalNode
-       - LLM Router 不可用则进入 FinalNode
+    ReAct Supervisor。
+    每次进入该节点都让 LLM 基于已有 Observation 决定下一步 Action。
     """
     emit({"node": "SupervisorNode", "status": "start"})
     started_at = time.perf_counter()
 
-    user_input = last_user_text(state)
     steps = _current_turn_steps(state)
     retry_count = state.get("retry_count", 0)
-    llm_traces: list[dict[str, Any]] = []
+    metadata = _input_metadata_for_state(state)
 
     if len(steps) >= MAX_GRAPH_STEPS:
         return {
             "next_node": "FinalNode",
-            "steps": ["SupervisorNode"],
-            "retry_count": retry_count,
-        }
-
-    latest_obs = latest_observation({"observations": _current_turn_observations(state)})
-
-    # 第一次进入 Supervisor：根据输入形态路由
-    if latest_obs is None:
-        uploaded_files = state.get("uploaded_files", [])
-        normalized_files = normalize_uploaded_files(
-            uploaded_files,
-            upload_workdir=state.get("upload_workdir", ""),
-        )
-
-        input_kind = infer_input_kind_by_files(
-            normalized_files=normalized_files,
-            user_input=user_input,
-        )
-
-        h5ad_files = get_h5ad_files(normalized_files)
-        rag_files = get_rag_files(normalized_files)
-
-        if h5ad_files:
-            next_node: NextNode = "scAnalysis"
-            intent: Intent = "sc_analysis"
-
-        elif rag_files:
-            next_node = "RAG"
-            intent = "rag"
-
-        elif input_kind == "text":
-            next_node, router_trace = _llm_route_for_text_only(state)
-            llm_traces.append(router_trace)
-
-            if next_node == "RAG":
-                intent = "rag"
-            elif next_node == "WebSearch":
-                intent = "web_search"
-            else:
-                intent = "chat"
-
-        else:
-            next_node = "FinalNode"
-            intent = "unknown"
-
-        emit(
-            {
-                "node": "SupervisorNode",
-                "status": "route",
-                "input_kind": input_kind,
-                "intent": intent,
-                "next_node": next_node,
-                "uploaded_files": uploaded_files,
-                "normalized_files": normalized_files,
-            }
-        )
-
-        route_tool_name, route_detail = _build_route_result(next_node)
-
-        return {
-            "input_kind": input_kind,
-            "intent": intent,
-            "next_node": next_node,
-            "normalized_files": normalized_files,
-            "h5ad_files": h5ad_files,
-            "rag_files": rag_files,
-            "knowledge_base_path": state.get(
-                "knowledge_base_path",
-                KNOWLEDGE_BASE_PATH,
-            ),
+            "current_action": "FinalNode",
+            "current_action_input": {},
+            "input_kind": metadata["input_kind"],
+            "normalized_files": metadata["normalized_files"],
+            "h5ad_files": metadata["h5ad_files"],
+            "rag_files": metadata["rag_files"],
             "steps": ["SupervisorNode"],
             "step_records": [
                 _build_step_record(
                     node="SupervisorNode",
                     elapsed_ms=_elapsed_ms(started_at),
-                    tool_name=route_tool_name,
-                    detail=route_detail,
-                    turn_id=_current_turn_id(state),
-                )
-            ],
-            "llm_traces": llm_traces,
-            "retry_count": retry_count,
-        }
-
-    # 工具执行后的观察判断
-    obs_node = latest_obs.get("node", "")
-    obs_ok = bool(latest_obs.get("ok", False))
-
-    if obs_ok:
-        if (
-            obs_node == "RAG"
-            and state.get("input_kind") == "text"
-            and not _rag_evidence_is_sufficient(state, latest_obs)
-        ):
-            emit(
-                {
-                    "node": "SupervisorNode",
-                    "status": "rag_low_confidence",
-                    "from": obs_node,
-                    "next_node": "WebSearch",
-                    "confidence": latest_obs.get("metadata", {}).get("confidence"),
-                    "confidence_threshold": latest_obs.get("metadata", {}).get("confidence_threshold"),
-                }
-            )
-
-            route_tool_name, route_detail = _build_route_result("WebSearch")
-
-            return {
-                "intent": "web_search",
-                "next_node": "WebSearch",
-                "steps": ["SupervisorNode"],
-                "step_records": [
-                    _build_step_record(
-                        node="SupervisorNode",
-                        elapsed_ms=_elapsed_ms(started_at),
-                        tool_name=route_tool_name,
-                        detail="RAG 本地证据置信度低于阈值，转入网页搜索。",
-                        turn_id=_current_turn_id(state),
-                    )
-                ],
-                "retry_count": retry_count,
-            }
-
-        emit(
-            {
-                "node": "SupervisorNode",
-                "status": "observation_ok",
-                "from": obs_node,
-                "next_node": "FinalNode",
-            }
-        )
-
-        route_tool_name, route_detail = _build_route_result("FinalNode")
-
-        return {
-            "next_node": "FinalNode",
-            "steps": ["SupervisorNode"],
-            "step_records": [
-                _build_step_record(
-                    node="SupervisorNode",
-                    elapsed_ms=_elapsed_ms(started_at),
-                    tool_name=route_tool_name,
-                    detail=route_detail,
+                    tool_name=_tool_name_for_step("FinalNode"),
+                    detail="达到最大 ReAct 步数，进入最终回答。",
                     turn_id=_current_turn_id(state),
                 )
             ],
             "retry_count": retry_count,
         }
 
-    # 工具失败后的回退策略
-    # 注意：这里也不根据关键词判断。
-    retry_count += 1
-
-    if retry_count >= 2:
-        next_node = "FinalNode"
-
-    elif obs_node == "RAG" and state.get("input_kind") == "text":
-        # 本地知识库没有给出有效证据时，才允许转入网页搜索。
-        next_node = "WebSearch"
-
-    elif obs_node == "WebSearch" and state.get("input_kind") == "text":
-        # 网页搜索失败时，可以让纯文本问题回到 FinalNode。
-        next_node = "FinalNode"
-
-    else:
-        next_node = "FinalNode"
-
+    next_node, router_trace, react_step = _llm_react_decision(state, metadata)
+    intent = {
+        "RAG": "rag",
+        "WebSearch": "web_search",
+        "scAnalysis": "sc_analysis",
+        "FinalNode": "chat",
+    }.get(next_node, "unknown")
     emit(
         {
             "node": "SupervisorNode",
-            "status": "observation_failed",
-            "from": obs_node,
+            "status": "route",
+            "input_kind": metadata["input_kind"],
+            "intent": intent,
             "next_node": next_node,
-            "retry_count": retry_count,
+            "action_input": react_step.get("action_input") or {},
+            "uploaded_files": metadata["uploaded_files"],
+            "normalized_files": metadata["normalized_files"],
         }
     )
 
-    route_tool_name, route_detail = _build_route_result(next_node)
-
+    route_detail = f"路由结果：{ROUTE_RESULT_LABEL_MAP.get(next_node, next_node or '未知节点')}"
     return {
+        "input_kind": metadata["input_kind"],
+        "intent": intent,
         "next_node": next_node,
+        "current_action": next_node,
+        "current_action_input": dict(react_step.get("action_input") or {}),
+        "normalized_files": metadata["normalized_files"],
+        "h5ad_files": metadata["h5ad_files"],
+        "rag_files": metadata["rag_files"],
+        "knowledge_base_path": state.get(
+            "knowledge_base_path",
+            KNOWLEDGE_BASE_PATH,
+        ),
         "steps": ["SupervisorNode"],
         "step_records": [
             _build_step_record(
                 node="SupervisorNode",
                 elapsed_ms=_elapsed_ms(started_at),
-                tool_name=route_tool_name,
-                detail=route_detail,
+                tool_name=_tool_name_for_step(next_node),
+                detail=str(react_step.get("thought") or route_detail),
                 turn_id=_current_turn_id(state),
             )
         ],
+        "llm_traces": [router_trace],
+        "react_steps": [react_step],
         "retry_count": retry_count,
     }
+
 
 def memory_node(state: AgentState) -> dict[str, Any]:
     emit({"node": "MemoryNode", "status": "start"})
@@ -875,7 +821,7 @@ def rag_node(state: AgentState) -> dict[str, Any]:
     emit({"node": "RAG", "status": "start"})
     started_at = time.perf_counter()
 
-    query = last_user_text(state)
+    query = _action_query(state)
     knowledge_base_path = state.get("knowledge_base_path", KNOWLEDGE_BASE_PATH)
     rag_index_dir = state.get("rag_index_dir", "")
     rag_files = _normalize_rag_files_for_base(
@@ -886,10 +832,19 @@ def rag_node(state: AgentState) -> dict[str, Any]:
     try:
         from .tools.RAG import build_rag_index, run_rag
 
-        if rag_files or (
-            _uses_session_knowledge_base(knowledge_base_path)
-            and _rag_index_missing(rag_index_dir)
-        ):
+        try:
+            uses_session_knowledge_base = (
+                Path(knowledge_base_path).expanduser().resolve()
+                != Path(KNOWLEDGE_BASE_PATH).expanduser().resolve()
+            )
+        except Exception:
+            uses_session_knowledge_base = True
+        index_root = Path(rag_index_dir).expanduser() if rag_index_dir else None
+        index_missing = not index_root or not all(
+            (index_root / item).exists() for item in ("chunks.jsonl", "bm25.pkl", "qdrant")
+        )
+
+        if rag_files or (uses_session_knowledge_base and index_missing):
             build_rag_index(
                 knowledge_base_path=knowledge_base_path,
                 index_dir=rag_index_dir,
@@ -959,7 +914,7 @@ def web_search_node(state: AgentState) -> dict[str, Any]:
     emit({"node": "WebSearch", "status": "start"})
     started_at = time.perf_counter()
 
-    query = last_user_text(state)
+    query = _action_query(state)
 
     try:
         from .tools.Web import web_search
@@ -1040,7 +995,7 @@ def sc_analysis_node(state: AgentState) -> dict[str, Any]:
             {
                 "user_id": state.get("user_id", "anonymous"),
                 "session_id": state.get("session_id", "default"),
-                "user_text": last_user_text(state),
+                "user_text": _action_query(state),
                 "h5ad_path": h5ad_path,
             }
         )

@@ -415,20 +415,56 @@ function updateRouteLlmOutput(message, data) {
   const delta = String(data.content_delta || '')
   const current = String(message.routeLlmOutput || '')
   message.routeLlmOutput = data.content != null ? String(data.content || '') : `${current}${delta}`
-  upsertRouteStreamEvent(message, 'router-llm-output', 'LLM Router 输出', message.routeLlmOutput)
+  upsertRouteStreamEvent(message, 'router-llm-output', '路由分析中', '正在生成路由决策...')
 }
 
 function appendRouteDecision(message, data) {
-  const node = String(data.next_node || data.decision || '')
+  const node = String(data.next_node || data.action || data.decision || '')
+  const thought = String(data.thought || data.reason || '').trim()
+  const query = String(data.action_input?.query || '').trim()
   const detail = [
-    data.content ? `LLM输出=${String(data.content || '')}` : '',
-    node ? `路由=${formatRouteIntent(node) || node}` : '',
+    thought ? `决策=${thought}` : '',
+    node ? `选择节点=${formatRouteIntent(node) || node}` : '',
     data.intent ? `意图=${formatRouteIntent(String(data.intent || ''))}` : '',
-    data.reason ? `原因=${String(data.reason || '')}` : '',
+    query ? `检索问题=${query}` : '',
   ]
     .filter(Boolean)
     .join(' | ')
-  appendRouteStreamEvent(message, '路由决策', detail)
+  upsertRouteStreamEvent(message, 'router-decision', '路由决策', detail)
+}
+
+function appendThoughtEvent(message, data) {
+  const kind = String(data.kind || '')
+  if (kind === 'router_start') {
+    upsertRouteStreamEvent(
+      message,
+      'router-start',
+      '开始路由',
+      String(data.plan || data.action || '准备选择下一步节点。'),
+    )
+    return
+  }
+
+  const step = Number(data.step)
+  const node = String(data.next_node || data.action || data.decision || '')
+  const thought = String(data.thought || data.reason || '').trim()
+  const detail = [
+    thought ? `决策=${thought}` : '',
+    node ? `选择节点=${formatRouteIntent(node) || node}` : '',
+    data.intent ? `意图=${formatRouteIntent(String(data.intent || ''))}` : '',
+    data.plan ? `计划=${String(data.plan || '')}` : '',
+    data.tool_name ? `工具=${String(data.tool_name || '')}` : '',
+  ]
+    .filter(Boolean)
+    .join(' | ')
+
+  if (!detail) {
+    return
+  }
+
+  const key = Number.isFinite(step) && step > 0 ? `thought-${step}` : `thought-${kind || data.node || 'latest'}`
+  const title = Number.isFinite(step) && step > 0 ? `第 ${step} 轮思考` : '思考'
+  upsertRouteStreamEvent(message, key, title, detail)
 }
 
 function updateStreamingAnswer(message, delta) {
@@ -1025,24 +1061,10 @@ async function submitMessage() {
           return
         }
         if (data.kind === 'router_decision') {
-          if (data.content) {
-            updateRouteLlmOutput(assistantMessage, data)
-          }
           appendRouteDecision(assistantMessage, data)
           return
         }
-        const detail = [
-          data.content ? `LLM输出=${String(data.content || '')}` : '',
-          data.intent ? `意图=${formatRouteIntent(String(data.intent || ''))}` : '',
-          data.next_node ? `路由=${formatRouteIntent(String(data.next_node || '')) || String(data.next_node || '')}` : '',
-          data.plan ? `计划=${String(data.plan || '')}` : '',
-          data.action ? `动作=${String(data.action || '')}` : '',
-          data.tool_name ? `工具=${String(data.tool_name || '')}` : '',
-          data.reason ? `原因=${String(data.reason || '')}` : '',
-        ]
-          .filter(Boolean)
-          .join(' | ')
-        appendRouteStreamEvent(assistantMessage, `第 ${Number(data.step || 0)} 轮思考`, detail)
+        appendThoughtEvent(assistantMessage, data)
         return
       }
       if (type === 'tool_start') {
@@ -1342,15 +1364,16 @@ onBeforeUnmount(() => {
                       </section>
 
                       <section v-if="routeModel(message)?.llmTraces?.length" class="route-section">
-                        <h4>LLM 原始输出</h4>
+                        <h4>路由决策</h4>
                         <article
                           v-for="(trace, index) in routeModel(message).llmTraces"
                           :key="`${message.id}-trace-${index}`"
                           class="trace-card"
                         >
-                          <p>{{ trace.response }}</p>
-                          <small v-if="trace.elapsedMs">
-                            {{ trace.label || 'llm' }} · {{ Number(trace.elapsedMs).toFixed(0) }} ms
+                          <p>{{ trace.decision }}</p>
+                          <small v-if="trace.selectedNode || trace.elapsedMs">
+                            {{ trace.selectedNode || trace.label || '路由' }}
+                            <span v-if="trace.elapsedMs"> · {{ Number(trace.elapsedMs).toFixed(0) }} ms</span>
                           </small>
                         </article>
                       </section>

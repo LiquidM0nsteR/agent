@@ -168,10 +168,11 @@ export function buildRouteTraceModel(source) {
     ? source.llm_traces
         .map((item) => ({
           label: String(item?.label || ''),
-          response: String(item?.response || item?.response_preview || ''),
+          decision: extractTraceDecision(item),
+          selectedNode: formatRouteIntent(String(item?.parsed_node || item?.action || '')),
           elapsedMs: item?.elapsed_ms,
         }))
-        .filter((item) => item.response)
+        .filter((item) => item.decision || item.selectedNode)
     : []
 
   if (
@@ -192,5 +193,25 @@ export function buildRouteTraceModel(source) {
     llmTraces,
     intentLabel: formatRouteIntent(String(source.intent || '')),
     dispatchedLabel: formatRouteIntent(String(source.dispatched_node || '')),
+  }
+}
+
+function extractTraceDecision(item) {
+  const direct = String(item?.thought || item?.reason || '').trim()
+  if (direct) {
+    return direct
+  }
+
+  const raw = String(item?.response || item?.response_preview || '').trim()
+  if (!raw) {
+    return ''
+  }
+
+  try {
+    const match = raw.match(/\{[\s\S]*\}/)
+    const payload = JSON.parse(match ? match[0] : raw)
+    return String(payload?.thought || payload?.reason || '').trim()
+  } catch {
+    return '已完成路由决策。'
   }
 }
