@@ -3,13 +3,14 @@ from __future__ import annotations
 import atexit
 import configparser
 import json
+import logging
 import os
-import re
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from threading import Lock
-from typing import Any
+from typing import Any, Sequence
+from uuid import NAMESPACE_URL, uuid5
 
 import pymysql
 from langchain.agents.middleware import SummarizationMiddleware
@@ -24,6 +25,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 DATA_DIR = PROJECT_ROOT / "data" / "memory"
 SHORT_TERM_DIR = DATA_DIR / "short_term"
 LONG_TERM_DIR = DATA_DIR / "long_term"
+LONG_TERM_VECTOR_DIR = DATA_DIR / "long_term_vectors"
 MYSQL_CNF_PATH = Path(
     os.getenv(
         "AGENT_MEMORY_MYSQL_CNF",
@@ -36,15 +38,51 @@ REDIS_TTL_MINUTES = int(os.getenv("AGENT_MEMORY_TTL_MINUTES", "1440"))
 DEFAULT_SUMMARY_TRIGGER = int(os.getenv("AGENT_SHORT_TERM_SUMMARY_TRIGGER", "24"))
 DEFAULT_KEEP_MESSAGES = int(os.getenv("AGENT_SHORT_TERM_KEEP_MESSAGES", "12"))
 DEFAULT_LONG_TERM_TOP_K = int(os.getenv("AGENT_LONG_TERM_TOP_K", "3"))
-MAX_LONG_TERM_CANDIDATES = int(os.getenv("AGENT_LONG_TERM_MAX_CANDIDATES", "200"))
+LONG_TERM_VECTOR_COLLECTION = os.getenv("AGENT_MEMORY_VECTOR_COLLECTION", "long_term_memories")
+LONG_TERM_VECTOR_SCORE_THRESHOLD = float(os.getenv("AGENT_MEMORY_VECTOR_SCORE_THRESHOLD", "0.2"))
+LONG_TERM_VECTOR_REBUILD_LIMIT = int(os.getenv("AGENT_MEMORY_VECTOR_REBUILD_LIMIT", "5000"))
 MYSQL_DATABASE = os.getenv("AGENT_MEMORY_MYSQL_DB", "agent_memory")
 MYSQL_USER = os.getenv("AGENT_MEMORY_MYSQL_USER", "root")
 MYSQL_PASSWORD = os.getenv("AGENT_MEMORY_MYSQL_PASSWORD", "123456")
+LOCAL_BGE_MODEL = PROJECT_ROOT / "models" / "bge-m3"
+DEFAULT_MEMORY_EMBEDDING_MODEL = (
+    os.getenv("AGENT_MEMORY_EMBEDDING_MODEL_PATH")
+    or os.getenv("EMBEDDING_MODEL_PATH")
+    or (str(LOCAL_BGE_MODEL) if LOCAL_BGE_MODEL.exists() else "BAAI/bge-m3")
+)
 
 SHORT_TERM_DIR.mkdir(parents=True, exist_ok=True)
 LONG_TERM_DIR.mkdir(parents=True, exist_ok=True)
+LONG_TERM_VECTOR_DIR.mkdir(parents=True, exist_ok=True)
 
 SUMMARY_PREFIX = "Here is a summary of the conversation to date:\n\n"
+LOGGER = logging.getLogger(__name__)
+_MEMORY_EMBEDDER_CACHE: dict[str, Any] = {}
+
+
+def _get_memory_embedder() -> Any:
+    cache_key = DEFAULT_MEMORY_EMBEDDING_MODEL
+    if cache_key in _MEMORY_EMBEDDER_CACHE:
+        return _MEMORY_EMBEDDER_CACHE[cache_key]
+
+    from sentence_transformers import SentenceTransformer
+
+    model = SentenceTransformer(DEFAULT_MEMORY_EMBEDDING_MODEL)
+    _MEMORY_EMBEDDER_CACHE[cache_key] = model
+    return model
+
+
+def _encode_memory_texts(texts: Sequence[str], *, batch_size: int = 16) -> list[list[float]]:
+    if not texts:
+        return []
+    model = _get_memory_embedder()
+    vectors = model.encode(
+        list(texts),
+        batch_size=batch_size,
+        normalize_embeddings=True,
+        show_progress_bar=False,
+    )
+    return [list(map(float, vector)) for vector in vectors]
 
 
 @dataclass(slots=True)
@@ -104,6 +142,7 @@ class MemoryManager:
             },
         )
         self.checkpointer.setup()
+        self._vector_lock = Lock()
         self._mysql_base_config = self._load_mysql_base_config()
         self._ensure_mysql_schema()
 
@@ -203,7 +242,8 @@ class MemoryManager:
                     "input_kind": str(state.get("input_kind") or ""),
                 },
             }
-            self._insert_long_term_memory(record)
+            record["id"] = self._insert_long_term_memory(record)
+            self._upsert_long_term_memory_vector(record)
             self._append_long_term_export(user_id, record)
 
     def clear_session(self, user_id: str, session_id: str) -> int:
@@ -228,10 +268,12 @@ class MemoryManager:
                     (user_id, session_id),
                 )
                 cleared += int(cursor.rowcount or 0)
+        self._delete_long_term_memory_vectors(user_id=user_id, session_id=session_id)
         return cleared
 
     def clear_user(self, user_id: str) -> int:
         cleared = 0
+        self._delete_long_term_memory_vectors(user_id=user_id)
         sessions_dir = PROJECT_ROOT / "data" / "users" / user_id / "sessions"
         if sessions_dir.exists():
             for session_dir in sessions_dir.iterdir():
@@ -242,6 +284,11 @@ class MemoryManager:
             with connection.cursor() as cursor:
                 cursor.execute(
                     "DELETE FROM user_profiles WHERE user_id = %s",
+                    (user_id,),
+                )
+                cleared += int(cursor.rowcount or 0)
+                cursor.execute(
+                    "DELETE FROM long_term_memories WHERE user_id = %s",
                     (user_id,),
                 )
                 cleared += int(cursor.rowcount or 0)
@@ -442,7 +489,7 @@ class MemoryManager:
                         (user_id, key, json.dumps(value, ensure_ascii=False)),
                     )
 
-    def _insert_long_term_memory(self, record: dict[str, Any]) -> None:
+    def _insert_long_term_memory(self, record: dict[str, Any]) -> int:
         with self._connect_db() as connection:
             with connection.cursor() as cursor:
                 cursor.execute(
@@ -464,6 +511,7 @@ class MemoryManager:
                         json.dumps(record["metadata"], ensure_ascii=False),
                     ),
                 )
+                return int(cursor.lastrowid or 0)
 
     def _search_long_term_memories(
         self,
@@ -473,61 +521,353 @@ class MemoryManager:
         query: str,
         top_k: int,
     ) -> list[LongTermMemoryHit]:
+        if top_k <= 0:
+            return []
+
+        hits = self._search_long_term_memory_vectors(
+            user_id=user_id,
+            session_id=session_id,
+            query=query,
+            top_k=top_k,
+        )
+        if hits or self._has_long_term_memory_vectors(user_id):
+            return hits
+
+        if self._rebuild_long_term_memory_vectors(user_id):
+            return self._search_long_term_memory_vectors(
+                user_id=user_id,
+                session_id=session_id,
+                query=query,
+                top_k=top_k,
+            )
+        return []
+
+    def _search_long_term_memory_vectors(
+        self,
+        *,
+        user_id: str,
+        session_id: str,
+        query: str,
+        top_k: int,
+    ) -> list[LongTermMemoryHit]:
+        del session_id
+        try:
+            query_vector = _encode_memory_texts([query], batch_size=1)[0]
+            points = self._query_long_term_memory_points(
+                user_id=user_id,
+                vector=query_vector,
+                limit=max(top_k * 4, top_k),
+            )
+        except Exception as exc:
+            LOGGER.warning("Long-term memory vector search failed: %s", exc)
+            return []
+
+        hits: list[LongTermMemoryHit] = []
+        for point in points:
+            score = float(getattr(point, "score", 0.0) or 0.0)
+            if score < LONG_TERM_VECTOR_SCORE_THRESHOLD:
+                continue
+            payload = dict(getattr(point, "payload", None) or {})
+            raw_metadata = payload.get("metadata_json") or "{}"
+            try:
+                metadata = json.loads(str(raw_metadata))
+            except Exception:
+                metadata = {}
+            metadata.update(
+                {
+                    "memory_id": payload.get("memory_id"),
+                    "session_id": payload.get("session_id", ""),
+                    "memory_type": payload.get("memory_type", ""),
+                    "created_at": payload.get("created_at", ""),
+                    "retrieval_source": "qdrant_vector",
+                }
+            )
+            content = str(payload.get("content") or "")
+            if not content:
+                continue
+            hits.append(LongTermMemoryHit(content=content, score=score, metadata=metadata))
+            if len(hits) >= top_k:
+                break
+        return hits
+
+    def _query_long_term_memory_points(
+        self,
+        *,
+        user_id: str,
+        vector: Sequence[float],
+        limit: int,
+    ) -> list[Any]:
+        from qdrant_client import models
+
+        query_filter = models.Filter(
+            must=[
+                models.FieldCondition(
+                    key="user_id",
+                    match=models.MatchValue(value=user_id),
+                )
+            ]
+        )
+        with self._vector_lock:
+            client = self._get_long_term_vector_client()
+            try:
+                response = client.query_points(
+                    collection_name=LONG_TERM_VECTOR_COLLECTION,
+                    query=list(vector),
+                    query_filter=query_filter,
+                    limit=limit,
+                    with_payload=True,
+                )
+                return list(getattr(response, "points", response))
+            except Exception as exc:
+                legacy_search = getattr(client, "search", None)
+                if not callable(legacy_search):
+                    raise exc
+                return list(
+                    legacy_search(
+                        collection_name=LONG_TERM_VECTOR_COLLECTION,
+                        query_vector=list(vector),
+                        query_filter=query_filter,
+                        limit=limit,
+                        with_payload=True,
+                    )
+                )
+            finally:
+                self._close_long_term_vector_client(client)
+
+    def _upsert_long_term_memory_vector(self, record: dict[str, Any]) -> None:
+        content = str(record.get("content") or "").strip()
+        if not content:
+            return
+        try:
+            vector = _encode_memory_texts([content], batch_size=1)[0]
+            self._ensure_long_term_vector_collection(len(vector))
+            from qdrant_client import models
+
+            metadata = dict(record.get("metadata") or {})
+            payload = {
+                "memory_id": int(record.get("id") or 0),
+                "user_id": str(record.get("user_id") or ""),
+                "session_id": str(record.get("session_id") or ""),
+                "memory_type": str(record.get("memory_type") or ""),
+                "content": content,
+                "metadata_json": json.dumps(metadata, ensure_ascii=False),
+                "created_at": self._now_iso(),
+            }
+            point_id = self._long_term_memory_point_id(payload)
+            with self._vector_lock:
+                client = self._get_long_term_vector_client()
+                try:
+                    client.upsert(
+                        collection_name=LONG_TERM_VECTOR_COLLECTION,
+                        points=[
+                            models.PointStruct(
+                                id=point_id,
+                                vector=vector,
+                                payload=payload,
+                            )
+                        ],
+                    )
+                finally:
+                    self._close_long_term_vector_client(client)
+        except Exception as exc:
+            LOGGER.warning("Long-term memory vector upsert failed: %s", exc)
+
+    def _rebuild_long_term_memory_vectors(self, user_id: str) -> bool:
         with self._connect_db() as connection:
             with connection.cursor() as cursor:
                 cursor.execute(
                     """
-                    SELECT session_id, memory_type, content, metadata_json, created_at
+                    SELECT id, user_id, session_id, memory_type, content, metadata_json, created_at
                     FROM long_term_memories
                     WHERE user_id = %s
                     ORDER BY created_at DESC
                     LIMIT %s
                     """,
-                    (user_id, MAX_LONG_TERM_CANDIDATES),
+                    (user_id, LONG_TERM_VECTOR_REBUILD_LIMIT),
                 )
                 rows = cursor.fetchall()
 
-        hits: list[LongTermMemoryHit] = []
-        for row in rows:
+        if not rows:
+            return False
+
+        records: list[dict[str, Any]] = []
+        for row in reversed(rows):
+            content = str(row.get("content") or "").strip()
+            if not content:
+                continue
             raw_metadata = row.get("metadata_json") or "{}"
             try:
                 metadata = json.loads(raw_metadata)
             except Exception:
                 metadata = {}
-            metadata.setdefault("session_id", row.get("session_id", ""))
-            metadata.setdefault("memory_type", row.get("memory_type", ""))
-            metadata.setdefault("created_at", str(row.get("created_at") or ""))
+            records.append(
+                {
+                    "id": int(row.get("id") or 0),
+                    "user_id": str(row.get("user_id") or ""),
+                    "session_id": str(row.get("session_id") or ""),
+                    "memory_type": str(row.get("memory_type") or ""),
+                    "content": content,
+                    "metadata": metadata,
+                    "created_at": str(row.get("created_at") or ""),
+                }
+            )
+        if not records:
+            return False
 
-            content = str(row.get("content") or "")
-            score = self._score_memory_hit(query, content, metadata, session_id)
-            if score <= 0:
-                continue
-            hits.append(LongTermMemoryHit(content=content, score=score, metadata=metadata))
+        try:
+            batch_size = 64
+            first_vector = _encode_memory_texts([records[0]["content"]], batch_size=1)[0]
+            self._ensure_long_term_vector_collection(len(first_vector))
 
-        hits.sort(key=lambda item: item.score, reverse=True)
-        return hits[: max(top_k, 0)]
+            from qdrant_client import models
 
-    def _score_memory_hit(
-        self,
-        query: str,
-        content: str,
-        metadata: dict[str, Any],
-        current_session_id: str,
-    ) -> float:
-        query_tokens = self._tokenize(query)
-        if not query_tokens:
-            return 0.0
+            first_point = models.PointStruct(
+                id=self._long_term_memory_point_id(records[0]),
+                vector=first_vector,
+                payload=self._long_term_memory_payload(records[0]),
+            )
+            with self._vector_lock:
+                client = self._get_long_term_vector_client()
+                try:
+                    client.upsert(collection_name=LONG_TERM_VECTOR_COLLECTION, points=[first_point])
+                finally:
+                    self._close_long_term_vector_client(client)
 
-        haystack = f"{content}\n{json.dumps(metadata, ensure_ascii=False, sort_keys=True)}"
-        haystack_tokens = set(self._tokenize(haystack))
-        overlap = sum(1 for token in query_tokens if token in haystack_tokens)
+            for start in range(1, len(records), batch_size):
+                batch = records[start : start + batch_size]
+                vectors = _encode_memory_texts(
+                    [str(record.get("content") or "") for record in batch],
+                    batch_size=16,
+                )
+                points = [
+                    models.PointStruct(
+                        id=self._long_term_memory_point_id(record),
+                        vector=vector,
+                        payload=self._long_term_memory_payload(record),
+                    )
+                    for record, vector in zip(batch, vectors)
+                ]
+                with self._vector_lock:
+                    client = self._get_long_term_vector_client()
+                    try:
+                        client.upsert(collection_name=LONG_TERM_VECTOR_COLLECTION, points=points)
+                    finally:
+                        self._close_long_term_vector_client(client)
+            return True
+        except Exception as exc:
+            LOGGER.warning("Long-term memory vector rebuild failed: %s", exc)
+            return False
 
-        score = overlap / max(len(set(query_tokens)), 1)
-        if query.strip() and query.strip().lower() in haystack.lower():
-            score += 0.5
-        if str(metadata.get("session_id") or "") == current_session_id:
-            score += 0.15
-        return round(score, 6)
+    def _has_long_term_memory_vectors(self, user_id: str) -> bool:
+        try:
+            from qdrant_client import models
+
+            query_filter = models.Filter(
+                must=[
+                    models.FieldCondition(
+                        key="user_id",
+                        match=models.MatchValue(value=user_id),
+                    )
+                ]
+            )
+            with self._vector_lock:
+                client = self._get_long_term_vector_client()
+                try:
+                    result = client.count(
+                        collection_name=LONG_TERM_VECTOR_COLLECTION,
+                        count_filter=query_filter,
+                        exact=False,
+                    )
+                finally:
+                    self._close_long_term_vector_client(client)
+            return int(getattr(result, "count", 0) or 0) > 0
+        except Exception:
+            return False
+
+    def _delete_long_term_memory_vectors(self, *, user_id: str, session_id: str | None = None) -> None:
+        try:
+            from qdrant_client import models
+
+            must = [
+                models.FieldCondition(
+                    key="user_id",
+                    match=models.MatchValue(value=user_id),
+                )
+            ]
+            if session_id is not None:
+                must.append(
+                    models.FieldCondition(
+                        key="session_id",
+                        match=models.MatchValue(value=session_id),
+                    )
+            )
+            with self._vector_lock:
+                client = self._get_long_term_vector_client()
+                try:
+                    client.delete(
+                        collection_name=LONG_TERM_VECTOR_COLLECTION,
+                        points_selector=models.FilterSelector(filter=models.Filter(must=must)),
+                    )
+                finally:
+                    self._close_long_term_vector_client(client)
+        except Exception as exc:
+            LOGGER.warning("Long-term memory vector delete failed: %s", exc)
+
+    def _get_long_term_vector_client(self) -> Any:
+        from qdrant_client import QdrantClient
+
+        LONG_TERM_VECTOR_DIR.mkdir(parents=True, exist_ok=True)
+        return QdrantClient(path=str(LONG_TERM_VECTOR_DIR))
+
+    def _ensure_long_term_vector_collection(self, vector_size: int) -> None:
+        from qdrant_client import models
+
+        with self._vector_lock:
+            client = self._get_long_term_vector_client()
+            try:
+                client.get_collection(collection_name=LONG_TERM_VECTOR_COLLECTION)
+                return
+            except Exception:
+                client.create_collection(
+                    collection_name=LONG_TERM_VECTOR_COLLECTION,
+                    vectors_config=models.VectorParams(
+                        size=vector_size,
+                        distance=models.Distance.COSINE,
+                    ),
+                )
+            finally:
+                self._close_long_term_vector_client(client)
+
+    def _close_long_term_vector_client(self, client: Any) -> None:
+        close = getattr(client, "close", None)
+        if callable(close):
+            close()
+
+    def _long_term_memory_payload(self, record: dict[str, Any]) -> dict[str, Any]:
+        return {
+            "memory_id": int(record.get("id") or 0),
+            "user_id": str(record.get("user_id") or ""),
+            "session_id": str(record.get("session_id") or ""),
+            "memory_type": str(record.get("memory_type") or ""),
+            "content": str(record.get("content") or ""),
+            "metadata_json": json.dumps(dict(record.get("metadata") or {}), ensure_ascii=False),
+            "created_at": str(record.get("created_at") or self._now_iso()),
+        }
+
+    def _long_term_memory_point_id(self, record: dict[str, Any]) -> str:
+        memory_id = int(record.get("memory_id") or record.get("id") or 0)
+        if memory_id:
+            key = f"{MYSQL_DATABASE}:{memory_id}"
+        else:
+            key = "::".join(
+                [
+                    str(record.get("user_id") or ""),
+                    str(record.get("session_id") or ""),
+                    str(record.get("memory_type") or ""),
+                    str(record.get("content") or ""),
+                ]
+            )
+        return str(uuid5(NAMESPACE_URL, key))
 
     def _build_memory_context(
         self,
@@ -666,9 +1006,6 @@ class MemoryManager:
             json.dumps(payload, ensure_ascii=False, indent=2),
             encoding="utf-8",
         )
-
-    def _tokenize(self, text: str) -> list[str]:
-        return [token for token in re.findall(r"[\u4e00-\u9fff]+|[A-Za-z0-9_]+", text.lower()) if token]
 
     def _truncate_text(self, text: str, limit: int) -> str:
         compact = " ".join(str(text or "").split())

@@ -317,6 +317,101 @@ class LocalQwenVL:
             completion_tokens=completion_tokens,
         )
 
+    def stream_generate(
+        self,
+        prompt: Optional[str] = None,
+        images: Optional[Sequence[Union[str, Path, Any]]] = None,
+        messages: Optional[List[Dict[str, Any]]] = None,
+        system_prompt: Optional[str] = None,
+        gen_config: Optional[GenerationConfig] = None,
+        **extra_generate_kwargs: Any,
+    ):
+        """
+        同步流式推理接口，逐段 yield 新生成文本。
+        """
+        self.load()
+
+        if messages is None:
+            if prompt is None:
+                raise ValueError("prompt 和 messages 不能同时为空。")
+            messages = self._build_messages(
+                prompt=prompt,
+                images=images,
+                system_prompt=system_prompt,
+            )
+        else:
+            if system_prompt:
+                messages = [
+                    {
+                        "role": "system",
+                        "content": system_prompt,
+                    },
+                    *messages,
+                ]
+
+        generation_config = gen_config or self.gen_config
+
+        assert self.model is not None
+        assert self.processor is not None
+        assert self.process_vision_info is not None
+
+        try:
+            from transformers import TextIteratorStreamer
+        except ImportError as exc:
+            raise ImportError("缺少 transformers TextIteratorStreamer，无法流式输出。") from exc
+
+        text = self.processor.apply_chat_template(
+            messages,
+            tokenize=False,
+            add_generation_prompt=True,
+        )
+        image_inputs, video_inputs = self.process_vision_info(messages)
+        inputs = self.processor(
+            text=[text],
+            images=image_inputs,
+            videos=video_inputs,
+            padding=True,
+            return_tensors="pt",
+        )
+        inputs = inputs.to(self._get_input_device())
+
+        generate_kwargs = self._build_generate_kwargs(
+            gen_config=generation_config,
+            extra_generate_kwargs=extra_generate_kwargs,
+        )
+        streamer = TextIteratorStreamer(
+            self.processor.tokenizer,
+            skip_prompt=True,
+            skip_special_tokens=True,
+            clean_up_tokenization_spaces=False,
+        )
+        errors: Queue[BaseException] = Queue(maxsize=1)
+
+        def generate_worker() -> None:
+            try:
+                with torch.inference_mode():
+                    self.model.generate(
+                        **inputs,
+                        streamer=streamer,
+                        **generate_kwargs,
+                    )
+            except BaseException as exc:
+                errors.put(exc)
+                on_finalized = getattr(streamer, "on_finalized_text", None)
+                if callable(on_finalized):
+                    on_finalized("", stream_end=True)
+
+        worker = threading.Thread(target=generate_worker, daemon=True)
+        worker.start()
+
+        for piece in streamer:
+            if piece:
+                yield piece
+
+        worker.join()
+        if not errors.empty():
+            raise errors.get()
+
     async def agenerate(
         self,
         prompt: Optional[str] = None,
@@ -361,6 +456,20 @@ class LocalQwenVL:
         )
 
         return response.text
+
+    def chat_stream(
+        self,
+        prompt: str,
+        images: Optional[Sequence[Union[str, Path, Any]]] = None,
+        system_prompt: Optional[str] = None,
+        **kwargs: Any,
+    ):
+        yield from self.stream_generate(
+            prompt=prompt,
+            images=images,
+            system_prompt=system_prompt,
+            **kwargs,
+        )
 
     async def achat(
         self,
@@ -630,6 +739,21 @@ def chat(
 ) -> str:
     with acquire_llm() as llm:
         return llm.chat(
+            prompt=prompt,
+            images=images,
+            system_prompt=system_prompt,
+            **kwargs,
+        )
+
+
+def chat_stream(
+    prompt: str,
+    images: Optional[Sequence[Union[str, Path, Any]]] = None,
+    system_prompt: Optional[str] = None,
+    **kwargs: Any,
+):
+    with acquire_llm() as llm:
+        yield from llm.chat_stream(
             prompt=prompt,
             images=images,
             system_prompt=system_prompt,

@@ -4,8 +4,12 @@ from __future__ import annotations
 
 import os
 import json
+from contextlib import contextmanager
+from contextvars import ContextVar
+from datetime import datetime
 from pathlib import Path
-from typing import Any, Optional, Literal, TypedDict
+from typing import Any, Callable, Iterator, Optional, Literal, TypedDict
+from uuid import uuid4
 
 from langchain_core.messages import HumanMessage
 
@@ -16,6 +20,11 @@ except Exception:
 
 Intent = Literal["rag", "web_search", "sc_analysis", "chat", "unknown"]
 InputKind = Literal["text", "pdf", "h5ad", "markdown", "mixed", "unknown"]
+StreamEventCallback = Callable[[dict[str, Any]], None]
+_STREAM_EVENT_CALLBACK: ContextVar[StreamEventCallback | None] = ContextVar(
+    "agent_stream_event_callback",
+    default=None,
+)
 
 
 # =========================
@@ -36,6 +45,7 @@ MAX_GRAPH_STEPS = int(os.getenv("AGENT_MAX_GRAPH_STEPS", "8"))
 TEXT_SUFFIXES = {".txt",".md",".markdown"}
 PDF_SUFFIXES = {".pdf"}
 H5AD_SUFFIXES = {".h5ad"}
+IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".webp", ".bmp", ".gif"}
 CODE_SUFFIXES = {
     ".py",".cpp",".cc",".cxx",".c",".h",".hpp",".hh",".java",
     ".js",".ts",".tsx",".jsx",".vue",".go",".rs",".sh",".bash",
@@ -51,11 +61,104 @@ class UploadedFileInfo(TypedDict, total=False):
     converted: bool
 
 
+def now_iso() -> str:
+    return datetime.now().isoformat(timespec="seconds")
+
+
+def safe_id(value: str | None, default: str) -> str:
+    raw = str(value or "").strip()
+    safe = "".join(char for char in raw if char.isalnum() or char in {"-", "_"})
+    return safe or default
+
+
+def safe_filename(filename: str | None) -> str:
+    raw = str(filename or "upload.bin").strip()
+    safe = "".join(char for char in raw if char.isalnum() or char in {".", "-", "_"})
+    return safe or "upload.bin"
+
+
+def safe_relpath(value: str) -> Path:
+    candidate = Path(str(value or "").replace("\\", "/").lstrip("/"))
+    if candidate.is_absolute() or ".." in candidate.parts:
+        raise ValueError("Invalid path")
+    return candidate
+
+
+def truncate_text(text: str, limit: int = 96) -> str:
+    compact = " ".join(str(text or "").split())
+    if len(compact) <= limit:
+        return compact
+    return compact[: limit - 3].rstrip() + "..."
+
+
+def new_session_id() -> str:
+    return datetime.now().strftime("%Y%m%d-%H%M%S") + f"-{uuid4().hex[:8]}"
+
+
+def is_local_knowledge_upload_request(text: str) -> bool:
+    lowered = str(text or "").lower()
+    knowledge_terms = ("本地知识库", "知识库", "local knowledge", "knowledge base")
+    action_terms = ("上传", "加入", "添加", "保存", "导入", "copy", "add", "import", "save")
+    return any(term in lowered for term in knowledge_terms) and any(term in lowered for term in action_terms)
+
+
+def is_rag_upload_candidate(saved_file: dict[str, Any]) -> bool:
+    kind = str(saved_file.get("kind") or "")
+    if kind == "pdf":
+        return False
+    if kind in {"text", "markdown"}:
+        return True
+    if kind in {"h5ad", "image"}:
+        return False
+    suffix = Path(str(saved_file.get("original_name") or saved_file.get("path") or "")).suffix.lower()
+    return suffix != ".pdf" and suffix not in H5AD_SUFFIXES and suffix not in IMAGE_SUFFIXES
+
+
+def has_session_rag_sources(uploads_root: Path) -> bool:
+    if not uploads_root.exists():
+        return False
+    rag_suffixes = PDF_SUFFIXES | TEXT_SUFFIXES
+    for path in uploads_root.rglob("*"):
+        if path.is_file() and path.suffix.lower() in (rag_suffixes - PDF_SUFFIXES):
+            return True
+    return False
+
+
+def build_effective_user_text(raw_text: str, saved_files: list[dict[str, Any]]) -> str:
+    text = raw_text.strip()
+    if text:
+        return text
+    if any(item["kind"] == "h5ad" for item in saved_files):
+        return "请分析已上传的 h5ad 文件。"
+    if any(item["kind"] in {"text", "markdown"} for item in saved_files):
+        return "请总结已上传文件的核心内容。"
+    if any(item["kind"] == "pdf" for item in saved_files):
+        return "已上传 PDF 附件。除非明确要求加入本地知识库，本轮不会自动索引该 PDF。"
+    return "请处理已上传的附件。"
+
+
 # =========================
 # 3. LangGraph Streaming 工具
 # =========================
 
+@contextmanager
+def stream_event_callback(callback: StreamEventCallback | None) -> Iterator[None]:
+    token = _STREAM_EVENT_CALLBACK.set(callback)
+    try:
+        yield
+    finally:
+        _STREAM_EVENT_CALLBACK.reset(token)
+
+
 def emit(event: dict[str, Any]) -> None:
+    callback = _STREAM_EVENT_CALLBACK.get()
+    if callback is not None:
+        try:
+            callback(event)
+        except Exception:
+            pass
+        return
+
     if get_stream_writer is None:
         return
 

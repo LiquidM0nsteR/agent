@@ -14,6 +14,7 @@ from __future__ import annotations
 from collections import Counter
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass, field
+import gc
 import hashlib
 import json
 import logging
@@ -25,6 +26,7 @@ import shutil
 import subprocess
 import tempfile
 import time
+import unicodedata
 from typing import Any, Callable, Iterable, Iterator, Sequence
 from uuid import NAMESPACE_URL, uuid5
 
@@ -309,15 +311,43 @@ def _sha1(text: str, n: int = 20) -> str:
     return hashlib.sha1(text.encode("utf-8", errors="ignore")).hexdigest()[:n]
 
 
+def _strip_invalid_unicode(text: Any) -> str:
+    return "".join(
+        " "
+        if unicodedata.category(ch).startswith("C") and ch not in {"\n", "\t"}
+        else ch
+        for ch in str(text or "")
+    )
+
+
 def _normalize_text(text: Any) -> str:
-    value = str(text or "").replace("\x00", " ")
+    value = _strip_invalid_unicode(text).replace("\x00", " ")
     value = re.sub(r"[ \t\r\f\v]+", " ", value)
     value = re.sub(r"\n{3,}", "\n\n", value)
     return value.strip()
 
 
+def _embedding_safe_text(text: Any) -> str:
+    return _normalize_text(text) or " "
+
+
+def _sanitize_jsonable(data: Any) -> Any:
+    if isinstance(data, str):
+        return _normalize_text(data)
+    if isinstance(data, dict):
+        return {
+            _normalize_text(key): _sanitize_jsonable(value)
+            for key, value in data.items()
+        }
+    if isinstance(data, list):
+        return [_sanitize_jsonable(item) for item in data]
+    if isinstance(data, tuple):
+        return [_sanitize_jsonable(item) for item in data]
+    return data
+
+
 def _json_dumps(data: Any) -> str:
-    return json.dumps(data, ensure_ascii=False, default=str)
+    return json.dumps(_sanitize_jsonable(data), ensure_ascii=False, default=str)
 
 
 def _write_jsonl(path: Path, rows: Iterable[dict[str, Any]]) -> None:
@@ -358,6 +388,7 @@ def _make_doc_record(path: Path, kb_root: Path) -> DocumentRecord:
 
 
 def _iter_files(base_path: Path, files: list[str] | None = None) -> list[Path]:
+    base = base_path.resolve()
     if files:
         resolved: list[Path] = []
         for item in files:
@@ -365,6 +396,11 @@ def _iter_files(base_path: Path, files: list[str] | None = None) -> list[Path]:
             if not path.is_absolute():
                 path = base_path / path
             path = path.resolve()
+            try:
+                path.relative_to(base)
+            except ValueError:
+                logger.warning("Skip RAG file outside knowledge_base_path: file=%s root=%s", path, base)
+                continue
             if path.exists() and path.is_file() and path.suffix.lower() in SUPPORTED_SUFFIXES:
                 resolved.append(path)
         return sorted(set(resolved), key=lambda item: item.as_posix())
@@ -1658,7 +1694,26 @@ def semantic_recursive_sentence_split(
             chunk_overlap=0,
         )
 
-    vectors = _encode_texts(sentence_units, config)
+    try:
+        vectors = _encode_texts(sentence_units, config)
+    except Exception as exc:
+        logger.warning("Semantic chunk embedding failed, fallback to recursive split: %s", exc)
+        return recursive_sentence_split(
+            text,
+            chunk_size=config.chunk_size,
+            chunk_overlap=config.chunk_overlap,
+        )
+    if len(vectors) != len(sentence_units):
+        logger.warning(
+            "Semantic chunk embedding count mismatch, fallback to recursive split: vectors=%s sentences=%s",
+            len(vectors),
+            len(sentence_units),
+        )
+        return recursive_sentence_split(
+            text,
+            chunk_size=config.chunk_size,
+            chunk_overlap=config.chunk_overlap,
+        )
     boundary_scores = _semantic_boundary_scores(units, vectors)
     min_chars = max(80, min(config.semantic_chunk_min_chars, config.chunk_size // 2))
     max_chars = max(config.chunk_size, min_chars * 2)
@@ -1810,6 +1865,14 @@ _EMBEDDER_CACHE: dict[str, Any] = {}
 _RERANKER_CACHE: dict[str, Any] = {}
 
 
+def _release_reranker_after_use_enabled() -> bool:
+    return os.getenv("RAG_RELEASE_RERANKER_AFTER_USE", "true").lower() in {"1", "true", "yes"}
+
+
+def _reranker_cache_key(config: RAGConfig) -> str:
+    return f"{config.rerank_model_path}::{config.device or ''}"
+
+
 def _get_embedder(config: RAGConfig) -> Any:
     cache_key = f"{config.embedding_model_path}::{config.device or ''}"
     if cache_key in _EMBEDDER_CACHE:
@@ -1833,13 +1896,49 @@ def _encode_texts(
 ) -> list[list[float]]:
     if not texts:
         return []
+    normalized_texts = [
+        _embedding_safe_text(item)
+        for item in texts
+    ]
     model = _get_embedder(config)
-    vectors = model.encode(
-        list(texts),
-        batch_size=batch_size,
-        normalize_embeddings=True,
-        show_progress_bar=False,
-    )
+    try:
+        vectors = model.encode(
+            normalized_texts,
+            batch_size=batch_size,
+            normalize_embeddings=True,
+            show_progress_bar=False,
+        )
+    except TypeError as exc:
+        logger.warning("Batch embedding failed, retrying item by item: %s", exc)
+        recovered: list[list[float]] = []
+        fallback_vector: list[float] | None = None
+        for index, text in enumerate(normalized_texts):
+            try:
+                item_vectors = model.encode(
+                    [text],
+                    batch_size=1,
+                    normalize_embeddings=True,
+                    show_progress_bar=False,
+                )
+                vector = list(map(float, item_vectors[0]))
+                recovered.append(vector)
+                fallback_vector = vector
+            except Exception as item_exc:
+                logger.warning(
+                    "Embedding failed for text segment index=%s, using fallback vector: %s",
+                    index,
+                    item_exc,
+                )
+                if fallback_vector is None:
+                    fallback_vectors = model.encode(
+                        ["unreadable text segment"],
+                        batch_size=1,
+                        normalize_embeddings=True,
+                        show_progress_bar=False,
+                    )
+                    fallback_vector = list(map(float, fallback_vectors[0]))
+                recovered.append(list(fallback_vector))
+        return recovered
     return [list(map(float, vector)) for vector in vectors]
 
 
@@ -2096,7 +2195,7 @@ def _dense_search(
     allowed_files: set[str] | None = None,
 ) -> list[tuple[str, float]]:
     allowed = allowed_files or set()
-    query_vector = _encode_texts([query], config, batch_size=1)[0]
+    query_vector = _encode_texts([query], config, batch_size=32)[0]
 
     with _qdrant_lock(config):
         client = _get_qdrant_client(config)
@@ -2110,8 +2209,11 @@ def _dense_search(
                 with_payload=True,
             )
             points = list(getattr(response, "points", response))
-        except Exception:
-            points = client.search(
+        except Exception as exc:
+            legacy_search = getattr(client, "search", None)
+            if not callable(legacy_search):
+                raise exc
+            points = legacy_search(
                 collection_name=config.collection_name,
                 query_vector=query_vector,
                 limit=limit,
@@ -2172,7 +2274,7 @@ def _rrf_fusion(
 
 
 def _get_reranker(config: RAGConfig) -> Any:
-    cache_key = f"{config.rerank_model_path}::{config.device or ''}"
+    cache_key = _reranker_cache_key(config)
     if cache_key in _RERANKER_CACHE:
         return _RERANKER_CACHE[cache_key]
 
@@ -2182,18 +2284,48 @@ def _get_reranker(config: RAGConfig) -> Any:
     if config.device:
         kwargs["devices"] = [config.device]
 
-    reranker = FlagReranker(config.rerank_model_path, **kwargs)
+    reranker = FlagReranker(config.rerank_model_path, batch_size=1, **kwargs)
     _RERANKER_CACHE[cache_key] = reranker
     return reranker
+
+
+def _release_reranker(config: RAGConfig) -> None:
+    cache_key = _reranker_cache_key(config)
+    reranker = _RERANKER_CACHE.pop(cache_key, None)
+    if reranker is None:
+        return
+
+    try:
+        model = getattr(reranker, "model", None)
+        if model is not None:
+            model.to("cpu")
+    except Exception as exc:
+        logger.debug("Failed to move reranker to CPU before release: %s", exc)
+
+    del reranker
+    gc.collect()
+
+    try:
+        import torch
+
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            torch.cuda.ipc_collect()
+    except Exception as exc:
+        logger.debug("Failed to clear CUDA cache after reranker release: %s", exc)
 
 
 def _rerank(query: str, hits: Sequence[SearchHit], config: RAGConfig) -> list[SearchHit]:
     if not hits or not config.enable_rerank:
         return list(hits)
 
-    reranker = _get_reranker(config)
-    pairs = [[query, hit.chunk.text] for hit in hits]
-    raw_scores = reranker.compute_score(pairs)
+    try:
+        reranker = _get_reranker(config)
+        pairs = [[query, hit.chunk.text] for hit in hits]
+        raw_scores = reranker.compute_score(pairs)
+    finally:
+        if _release_reranker_after_use_enabled():
+            _release_reranker(config)
 
     if isinstance(raw_scores, (int, float)):
         scores = [float(raw_scores)]
@@ -2326,12 +2458,17 @@ def run_rag(
     if not query:
         return {
             "status": "error",
+            "tool_name": "local_knowledge_base",
             "message": "query 不能为空",
+            "answer": "",
             "query": query,
             "content": "",
+            "artifacts": [],
             "chunks": [],
             "references": [],
             "grouped_results": [],
+            "metrics": {"tool_ms": round((time.perf_counter() - started) * 1000, 2)},
+            "meta": {},
         }
 
     config = get_rag_config(knowledge_base_path, index_dir=index_dir)
@@ -2373,38 +2510,57 @@ def run_rag(
         _build_reference(hit, idx)
         for idx, hit in enumerate(final_hits, start=1)
     ]
+    artifacts = [
+        {
+            "kind": "rag_artifact",
+            "path": str(reference.get("artifact_path") or ""),
+            "source_path": str(reference.get("source_path") or ""),
+            "page": reference.get("page"),
+            "block_type": reference.get("block_type"),
+        }
+        for reference in references
+        if reference.get("artifact_path")
+    ]
+    retrieval_trace = {
+        "pipeline": ["bm25", "dense_vector", "rrf", "rerank"],
+        "dense_top_k": config.dense_top_k,
+        "sparse_top_k": config.sparse_top_k,
+        "rrf_top_k": config.rrf_top_k,
+        "final_top_k": config.final_top_k,
+        "rrf_k": config.rrf_k,
+        "rerank_used": rerank_used,
+        "rerank_error": rerank_error,
+        "history_items": len(history or []),
+        "file_filter": list(files or []),
+        "index_dir": str(config.index_dir),
+        "knowledge_base_path": str(config.knowledge_base_path),
+        "collection_name": config.collection_name,
+        "supported_suffixes": sorted(SUPPORTED_SUFFIXES),
+    }
+    metrics = {
+        "tool_ms": round((time.perf_counter() - started) * 1000, 2),
+        "total_chunks": len(chunks),
+        "dense_hits": len(dense_results),
+        "sparse_hits": len(sparse_results),
+        "rrf_hits": len(fused_hits),
+        "final_hits": len(final_hits),
+    }
 
     return {
         "status": "ok",
+        "tool_name": "local_knowledge_base",
         "query": query,
+        "answer": content,
+        "message": content,
+        "local_answer": content,
         "content": content,
+        "artifacts": artifacts,
         "chunks": [hit.to_dict(include_text=True) for hit in final_hits],
         "references": references,
         "grouped_results": _format_grouped_results(final_hits),
-        "retrieval_trace": {
-            "pipeline": ["bm25", "dense_vector", "rrf", "rerank"],
-            "dense_top_k": config.dense_top_k,
-            "sparse_top_k": config.sparse_top_k,
-            "rrf_top_k": config.rrf_top_k,
-            "final_top_k": config.final_top_k,
-            "rrf_k": config.rrf_k,
-            "rerank_used": rerank_used,
-            "rerank_error": rerank_error,
-            "history_items": len(history or []),
-            "file_filter": list(files or []),
-            "index_dir": str(config.index_dir),
-            "knowledge_base_path": str(config.knowledge_base_path),
-            "collection_name": config.collection_name,
-            "supported_suffixes": sorted(SUPPORTED_SUFFIXES),
-        },
-        "metrics": {
-            "tool_ms": round((time.perf_counter() - started) * 1000, 2),
-            "total_chunks": len(chunks),
-            "dense_hits": len(dense_results),
-            "sparse_hits": len(sparse_results),
-            "rrf_hits": len(fused_hits),
-            "final_hits": len(final_hits),
-        },
+        "retrieval_trace": retrieval_trace,
+        "metrics": metrics,
+        "meta": retrieval_trace,
     }
 
 

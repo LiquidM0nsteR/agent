@@ -7,6 +7,7 @@ import operator
 import os
 import time
 import uuid
+from pathlib import Path
 from typing import Any, Optional, Literal, Annotated
 from typing_extensions import TypedDict
 
@@ -21,6 +22,7 @@ from .util import (
     last_user_text,
     safe_text,
     format_exception,
+    stream_event_callback,
     normalize_uploaded_files,
     infer_input_kind_by_files,
     get_h5ad_files,
@@ -87,6 +89,7 @@ class AgentState(TypedDict, total=False):
     tool_results: dict[str, Any]
     current_tool_results: dict[str, Any]
     current_tool_results_turn_id: str
+    llm_traces: Annotated[list[dict[str, Any]], operator.add]
     memory_context: str
     long_term_memories: list[dict[str, Any]]
 
@@ -109,26 +112,6 @@ ROUTE_RESULT_LABEL_MAP = {
     "FinalNode": "整理回答",
 }
 DEFAULT_RAG_CONFIDENCE_THRESHOLD = float(os.getenv("AGENT_RAG_CONFIDENCE_THRESHOLD", "0.35"))
-EXPLICIT_WEB_QUERY_MARKERS = (
-    "最新",
-    "最近",
-    "新闻",
-    "今天",
-    "当前",
-    "实时",
-    "搜一下",
-    "搜索",
-    "网页",
-    "网上",
-    "互联网",
-    "github",
-    "latest",
-    "recent",
-    "news",
-    "today",
-    "current",
-    "web",
-)
 
 
 # =========================
@@ -148,6 +131,57 @@ def _call_llm(
     return text
 
 
+def _call_llm_streaming(prompt: str) -> str:
+    from .tools.LLM import chat_stream
+
+    emit({"node": "FinalNode", "status": "answer_start", "label": "开始生成回答"})
+    chunks: list[str] = []
+    for delta in chat_stream(prompt=prompt):
+        text = str(delta or "")
+        if not text:
+            continue
+        chunks.append(text)
+        emit({"node": "FinalNode", "status": "answer_delta", "delta": text})
+
+    final_text = "".join(chunks).strip()
+    if not final_text:
+        raise RuntimeError("LLM.py 返回空结果。")
+    return final_text
+
+
+def _call_router_llm_streaming(prompt: str) -> str:
+    from .tools.LLM import chat_stream
+
+    emit(
+        {
+            "node": "SupervisorNode",
+            "status": "thought",
+            "kind": "router_start",
+            "action": "调用 LLM Router",
+            "plan": "判断当前输入应该进入本地知识库、网页搜索、单细胞分析或直接回答。",
+        }
+    )
+    chunks: list[str] = []
+    for delta in chat_stream(prompt=prompt):
+        text = str(delta or "")
+        if not text:
+            continue
+        chunks.append(text)
+        emit(
+            {
+                "node": "SupervisorNode",
+                "status": "thought",
+                "kind": "router_delta",
+                "content_delta": text,
+            }
+        )
+
+    router_output = "".join(chunks).strip()
+    if not router_output:
+        raise RuntimeError("LLM Router 返回空结果。")
+    return router_output
+
+
 def _tool_result_text(result: Any) -> str:
     if isinstance(result, dict):
         for key in ("answer", "local_answer", "message", "content"):
@@ -157,9 +191,52 @@ def _tool_result_text(result: Any) -> str:
     return safe_text(result)
 
 
-def _is_explicit_web_request(text: str) -> bool:
-    lowered = str(text or "").lower()
-    return any(marker in lowered for marker in EXPLICIT_WEB_QUERY_MARKERS)
+def _standardize_tool_result(
+    *,
+    node: str,
+    result: Any,
+    ok: bool,
+    content: str,
+    error: str,
+    elapsed_ms: float,
+    metadata: dict[str, Any],
+) -> dict[str, Any]:
+    tool_name = _tool_name_for_step(node)
+    if isinstance(result, dict):
+        payload = dict(result)
+    else:
+        payload = {}
+
+    answer = str(
+        payload.get("answer")
+        or payload.get("local_answer")
+        or payload.get("message")
+        or content
+        or ""
+    ).strip()
+    message = str(payload.get("message") or answer or error or "").strip()
+    metrics = dict(payload.get("metrics") or {})
+    metrics.setdefault("tool_ms", elapsed_ms)
+    meta = dict(payload.get("meta") or {})
+    meta.update(metadata)
+
+    payload.update(
+        {
+            "status": str(payload.get("status") or ("ok" if ok else "error")),
+            "tool_name": str(payload.get("tool_name") or tool_name),
+            "answer": answer,
+            "message": message,
+            "artifacts": list(payload.get("artifacts") or []),
+            "references": list(payload.get("references") or []),
+            "metrics": metrics,
+            "meta": meta,
+        }
+    )
+    if not payload.get("local_answer"):
+        payload["local_answer"] = answer
+    if error:
+        payload["error"] = error
+    return payload
 
 
 def _rag_confidence_threshold(state: AgentState) -> float:
@@ -238,6 +315,35 @@ def _format_web_search_content(result: Any) -> str:
             parts.append("\n\n".join(lines))
 
     return "\n\n".join(part for part in parts if part.strip()).strip() or safe_text(result)
+
+
+def _normalize_rag_files_for_base(files: list[str], knowledge_base_path: str) -> list[str]:
+    if not files:
+        return []
+    base = Path(knowledge_base_path or KNOWLEDGE_BASE_PATH).expanduser().resolve()
+    normalized: list[str] = []
+    for item in files:
+        path = Path(str(item)).expanduser()
+        resolved = path.resolve() if path.is_absolute() else (base / path).resolve()
+        try:
+            normalized.append(resolved.relative_to(base).as_posix())
+        except ValueError:
+            normalized.append(str(resolved))
+    return normalized
+
+
+def _rag_index_missing(index_dir: str) -> bool:
+    if not index_dir:
+        return True
+    root = Path(index_dir).expanduser()
+    return not all((root / item).exists() for item in ("chunks.jsonl", "bm25.pkl", "qdrant"))
+
+
+def _uses_session_knowledge_base(knowledge_base_path: str) -> bool:
+    try:
+        return Path(knowledge_base_path).expanduser().resolve() != Path(KNOWLEDGE_BASE_PATH).expanduser().resolve()
+    except Exception:
+        return True
 
 
 def _elapsed_ms(started_at: float) -> float:
@@ -366,16 +472,25 @@ def _tool_node_result(
         if str(state.get("current_tool_results_turn_id") or "") == turn_id
         else {}
     )
+    standardized_result = _standardize_tool_result(
+        node=node,
+        result=result,
+        ok=ok,
+        content=content,
+        error=error,
+        elapsed_ms=elapsed_ms,
+        metadata=metadata,
+    )
     current_tool_results = {
         **existing_current_tool_results,
-        tool_key: result if ok else None,
+        tool_key: standardized_result,
     }
 
     return {
         "observations": [obs],
         "tool_results": {
             **state.get("tool_results", {}),
-            tool_key: result if ok else None,
+            tool_key: standardized_result,
         },
         "current_tool_results": current_tool_results,
         "current_tool_results_turn_id": turn_id,
@@ -462,7 +577,7 @@ def _store_turn(
     )
 
 
-def _llm_route_for_text_only(state: AgentState) -> NextNode:
+def _llm_route_for_text_only(state: AgentState) -> tuple[NextNode, dict[str, Any]]:
     """
     纯文本输入时，允许使用 LLM Router 判断下一步。
     不再使用关键词匹配。
@@ -476,14 +591,35 @@ def _llm_route_for_text_only(state: AgentState) -> NextNode:
         memory_context=str(state.get("memory_context") or ""),
     )
 
-    router_output = _call_llm(prompt)
+    started_at = time.perf_counter()
+    router_output = _call_router_llm_streaming(prompt)
+    elapsed_ms = _elapsed_ms(started_at)
 
     next_node = parse_router_output(router_output)
 
     if next_node in {"RAG", "WebSearch", "FinalNode"}:
-        return next_node  # type: ignore[return-value]
+        parsed_node = next_node
+    else:
+        parsed_node = "FinalNode"
 
-    return "FinalNode"
+    trace = {
+        "label": "Supervisor Router",
+        "response": router_output,
+        "parsed_node": parsed_node,
+        "elapsed_ms": elapsed_ms,
+        "turn_id": _current_turn_id(state),
+    }
+    emit(
+        {
+            "node": "SupervisorNode",
+            "status": "thought",
+            "kind": "router_decision",
+            "content": router_output,
+            "next_node": parsed_node,
+            "reason": f"LLM Router 输出 {router_output!r}，解析为 {parsed_node}。",
+        }
+    )
+    return parsed_node, trace  # type: ignore[return-value]
 
 
 # =========================
@@ -508,6 +644,7 @@ def supervisor_node(state: AgentState) -> dict[str, Any]:
     user_input = last_user_text(state)
     steps = _current_turn_steps(state)
     retry_count = state.get("retry_count", 0)
+    llm_traces: list[dict[str, Any]] = []
 
     if len(steps) >= MAX_GRAPH_STEPS:
         return {
@@ -543,9 +680,8 @@ def supervisor_node(state: AgentState) -> dict[str, Any]:
             intent = "rag"
 
         elif input_kind == "text":
-            next_node = _llm_route_for_text_only(state)
-            if next_node == "WebSearch" and not _is_explicit_web_request(user_input):
-                next_node = "RAG"
+            next_node, router_trace = _llm_route_for_text_only(state)
+            llm_traces.append(router_trace)
 
             if next_node == "RAG":
                 intent = "rag"
@@ -593,6 +729,7 @@ def supervisor_node(state: AgentState) -> dict[str, Any]:
                     turn_id=_current_turn_id(state),
                 )
             ],
+            "llm_traces": llm_traces,
             "retry_count": retry_count,
         }
 
@@ -741,16 +878,22 @@ def rag_node(state: AgentState) -> dict[str, Any]:
     query = last_user_text(state)
     knowledge_base_path = state.get("knowledge_base_path", KNOWLEDGE_BASE_PATH)
     rag_index_dir = state.get("rag_index_dir", "")
-    rag_files = state.get("rag_files", [])
+    rag_files = _normalize_rag_files_for_base(
+        list(state.get("rag_files") or []),
+        knowledge_base_path,
+    )
 
     try:
         from .tools.RAG import build_rag_index, run_rag
 
-        if rag_files:
+        if rag_files or (
+            _uses_session_knowledge_base(knowledge_base_path)
+            and _rag_index_missing(rag_index_dir)
+        ):
             build_rag_index(
                 knowledge_base_path=knowledge_base_path,
                 index_dir=rag_index_dir,
-                files=rag_files,
+                files=rag_files or None,
                 clean=True,
             )
 
@@ -969,6 +1112,9 @@ def _fallback_final_answer(state: AgentState) -> str:
                     or sc_result.get("pdf_path")
                     or sc_result.get("report")
                 )
+                pdf_report = sc_result.get("pdf_report")
+                if not report_path and isinstance(pdf_report, dict):
+                    report_path = pdf_report.get("url") or pdf_report.get("path")
 
             if report_path:
                 return (
@@ -1017,7 +1163,7 @@ def final_node(state: AgentState) -> dict[str, Any]:
         memory_context=str(state.get("memory_context") or ""),
     )
 
-    llm_answer = _call_llm(final_prompt)
+    llm_answer = _call_llm_streaming(final_prompt)
     final_answer = llm_answer or _fallback_final_answer(state)
 
     emit({"node": "FinalNode", "status": "end"})
@@ -1143,6 +1289,7 @@ def stream_agent(
     upload_workdir: str = "",
     rag_index_dir: str = "",
     workspace_settings: Optional[dict[str, Any]] = None,
+    event_callback: Optional[Any] = None,
 ):
     """
     流式调用接口。
@@ -1165,12 +1312,14 @@ def stream_agent(
     )
     compiled_graph = get_graph()
 
-    for event in compiled_graph.stream(
-        initial_state,
-        config=runtime_config,
-        stream_mode=["updates", "custom"],
-    ):
-        yield event
+    stream_mode = ["updates"] if event_callback is not None else ["updates", "custom"]
+    with stream_event_callback(event_callback):
+        for event in compiled_graph.stream(
+            initial_state,
+            config=runtime_config,
+            stream_mode=stream_mode,
+        ):
+            yield event
 
     state_snapshot = compiled_graph.get_state(runtime_config)
     values = dict(getattr(state_snapshot, "values", {}) or {})
@@ -1183,3 +1332,4 @@ def stream_agent(
         state=values,
         workspace_settings=workspace_settings,
     )
+    yield ("final_state", values)

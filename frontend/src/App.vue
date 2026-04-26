@@ -274,6 +274,7 @@ function createUserMessage(content, attachments = [], createdAt = '') {
     artifact: null,
     loading: false,
     streamedAnswer: '',
+    routeLlmOutput: '',
   }
 }
 
@@ -290,6 +291,7 @@ function createAssistantMessage(content = '正在生成回复...') {
     artifact: null,
     loading: true,
     streamedAnswer: '',
+    routeLlmOutput: '',
   }
 }
 
@@ -395,6 +397,38 @@ function appendRouteStreamEvent(message, title, detail = '') {
   message.routeStreamEvents = Array.isArray(message.routeStreamEvents) ? message.routeStreamEvents : []
   message.routeStreamEvents.push({ title, detail })
   scrollChatToBottom()
+}
+
+function upsertRouteStreamEvent(message, key, title, detail = '') {
+  message.routeStreamEvents = Array.isArray(message.routeStreamEvents) ? message.routeStreamEvents : []
+  const existing = message.routeStreamEvents.find((item) => item.key === key)
+  if (existing) {
+    existing.title = title
+    existing.detail = detail
+  } else {
+    message.routeStreamEvents.push({ key, title, detail })
+  }
+  scrollChatToBottom()
+}
+
+function updateRouteLlmOutput(message, data) {
+  const delta = String(data.content_delta || '')
+  const current = String(message.routeLlmOutput || '')
+  message.routeLlmOutput = data.content != null ? String(data.content || '') : `${current}${delta}`
+  upsertRouteStreamEvent(message, 'router-llm-output', 'LLM Router 输出', message.routeLlmOutput)
+}
+
+function appendRouteDecision(message, data) {
+  const node = String(data.next_node || data.decision || '')
+  const detail = [
+    data.content ? `LLM输出=${String(data.content || '')}` : '',
+    node ? `路由=${formatRouteIntent(node) || node}` : '',
+    data.intent ? `意图=${formatRouteIntent(String(data.intent || ''))}` : '',
+    data.reason ? `原因=${String(data.reason || '')}` : '',
+  ]
+    .filter(Boolean)
+    .join(' | ')
+  appendRouteStreamEvent(message, '路由决策', detail)
 }
 
 function updateStreamingAnswer(message, delta) {
@@ -986,8 +1020,21 @@ async function submitMessage() {
         return
       }
       if (type === 'thought') {
+        if (data.kind === 'router_delta') {
+          updateRouteLlmOutput(assistantMessage, data)
+          return
+        }
+        if (data.kind === 'router_decision') {
+          if (data.content) {
+            updateRouteLlmOutput(assistantMessage, data)
+          }
+          appendRouteDecision(assistantMessage, data)
+          return
+        }
         const detail = [
+          data.content ? `LLM输出=${String(data.content || '')}` : '',
           data.intent ? `意图=${formatRouteIntent(String(data.intent || ''))}` : '',
+          data.next_node ? `路由=${formatRouteIntent(String(data.next_node || '')) || String(data.next_node || '')}` : '',
           data.plan ? `计划=${String(data.plan || '')}` : '',
           data.action ? `动作=${String(data.action || '')}` : '',
           data.tool_name ? `工具=${String(data.tool_name || '')}` : '',

@@ -618,6 +618,7 @@ def web_search(
     Returns:
         str 或 dict
     """
+    started_at = time.perf_counter()
     client = get_serper_client()
 
     output = client.search(
@@ -632,7 +633,47 @@ def web_search(
     )
 
     if return_json:
-        return output.to_dict(include_raw=include_raw)
+        data = output.to_dict(include_raw=include_raw)
+        references = [
+            {
+                "id": index,
+                "title": item.title,
+                "url": item.link,
+                "link": item.link,
+                "source": item.source,
+                "date": item.date,
+                "snippet": item.snippet,
+                "result_type": item.result_type,
+                "score": float(max(1, len(output.results) - index + 1)),
+            }
+            for index, item in enumerate(output.results, start=1)
+        ]
+        formatted = output.format_for_llm(max_results=k)
+        answer = output.answer.strip() or formatted
+        data.update(
+            {
+                "status": "ok",
+                "tool_name": "web_search",
+                "answer": answer,
+                "message": answer,
+                "local_answer": answer,
+                "artifacts": [],
+                "references": references,
+                "metrics": {
+                    "tool_ms": round((time.perf_counter() - started_at) * 1000, 2),
+                    "result_count": len(output.results),
+                },
+                "meta": {
+                    "search_type": output.search_type,
+                    "gl": gl,
+                    "hl": hl,
+                    "location": location or "",
+                    "freshness": freshness or "",
+                    "include_raw": include_raw,
+                },
+            }
+        )
+        return data
 
     return output.format_for_llm(max_results=k)
 

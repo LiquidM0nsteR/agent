@@ -4,9 +4,11 @@ import asyncio
 import json
 import os
 import shutil
+import threading
 from contextlib import asynccontextmanager
 from datetime import datetime
 from pathlib import Path
+from queue import Queue
 from typing import Any
 from uuid import uuid4
 
@@ -15,10 +17,26 @@ from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
-from .agent import run_agent
+from .agent import stream_agent
 from .memory import get_memory_manager
 from .tools.LLM import DEFAULT_LLM_INSTANCE_COUNT, initialize_llm_pool
 from .tools.RAG import build_rag_index
+from .util import (
+    H5AD_SUFFIXES,
+    IMAGE_SUFFIXES,
+    PDF_SUFFIXES,
+    TEXT_SUFFIXES,
+    build_effective_user_text as _build_effective_user_text,
+    has_session_rag_sources as _has_session_rag_sources,
+    is_local_knowledge_upload_request as _is_local_knowledge_upload_request,
+    is_rag_upload_candidate as _is_rag_upload_candidate,
+    new_session_id as _new_session_id,
+    now_iso as _now_iso,
+    safe_filename as _safe_filename,
+    safe_id as _safe_id,
+    safe_relpath as _safe_relpath,
+    truncate_text as _truncate_text,
+)
 
 
 BASE_DIR = Path(__file__).resolve().parent.parent
@@ -33,13 +51,11 @@ USERS_DIR.mkdir(parents=True, exist_ok=True)
 LOCAL_KNOWLEDGE_DIR.mkdir(parents=True, exist_ok=True)
 LOCAL_KNOWLEDGE_INDEX_DIR.mkdir(parents=True, exist_ok=True)
 
-IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".webp", ".bmp", ".gif"}
-RAG_SUFFIXES = {".pdf", ".txt", ".md", ".markdown"}
-H5AD_SUFFIXES = {".h5ad"}
+RAG_SUFFIXES = PDF_SUFFIXES | TEXT_SUFFIXES
 
 WORKSPACE_SETTINGS_DEFAULTS: dict[str, Any] = {
     "temperature": 0.2,
-    "max_new_tokens": 512,
+    "max_new_tokens": 2048,
     "short_term_max_messages": 12,
     "short_term_summary_threshold": 8,
     "long_term_top_k": 3,
@@ -101,42 +117,12 @@ class MemoryClearRequest(BaseModel):
     session_id: str = ""
 
 
-def _now_iso() -> str:
-    return datetime.now().isoformat(timespec="seconds")
-
-
-def _safe_id(value: str | None, default: str) -> str:
-    raw = str(value or "").strip()
-    safe = "".join(char for char in raw if char.isalnum() or char in {"-", "_"})
-    return safe or default
-
-
-def _safe_filename(filename: str | None) -> str:
-    raw = str(filename or "upload.bin").strip()
-    safe = "".join(char for char in raw if char.isalnum() or char in {".", "-", "_"})
-    return safe or "upload.bin"
-
-
-def _safe_relpath(value: str) -> Path:
-    candidate = Path(str(value or "").replace("\\", "/").lstrip("/"))
-    if candidate.is_absolute() or ".." in candidate.parts:
-        raise ValueError("Invalid path")
-    return candidate
-
-
 def _set_tool_status(name: str, state: str, detail: str = "") -> None:
     TOOL_STATUS[name] = {
         "state": state,
         "detail": detail,
         "updated_at": _now_iso(),
     }
-
-
-def _truncate_text(text: str, limit: int = 96) -> str:
-    compact = " ".join(str(text or "").split())
-    if len(compact) <= limit:
-        return compact
-    return compact[: limit - 3].rstrip() + "..."
 
 
 def _session_root(user_id: str, session_id: str) -> Path:
@@ -153,10 +139,6 @@ def _session_history_path(user_id: str, session_id: str) -> Path:
 
 def _workspace_settings_path(user_id: str) -> Path:
     return USERS_DIR / user_id / "workspace_settings.json"
-
-
-def _new_session_id() -> str:
-    return datetime.now().strftime("%Y%m%d-%H%M%S") + f"-{uuid4().hex[:8]}"
 
 
 def _load_session_meta(user_id: str, session_id: str) -> dict[str, Any] | None:
@@ -380,15 +362,85 @@ def _save_upload(upload: UploadFile, uploads_root: Path) -> dict[str, Any]:
     }
 
 
-def _build_effective_user_text(raw_text: str, saved_files: list[dict[str, Any]]) -> str:
-    text = raw_text.strip()
-    if text:
-        return text
-    if any(item["kind"] == "h5ad" for item in saved_files):
-        return "请分析已上传的 h5ad 文件。"
-    if any(item["kind"] in {"pdf", "text", "markdown"} for item in saved_files):
-        return "请总结已上传文件的核心内容。"
-    return "请处理已上传的附件。"
+def _copy_uploaded_pdfs_to_local_knowledge(saved_files: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    copied: list[dict[str, Any]] = []
+    LOCAL_KNOWLEDGE_DIR.mkdir(parents=True, exist_ok=True)
+    for item in saved_files:
+        if str(item.get("kind") or "") != "pdf":
+            continue
+        source = Path(str(item.get("path") or "")).expanduser()
+        if not source.exists() or not source.is_file():
+            continue
+        safe_name = _safe_filename(str(item.get("original_name") or source.name))
+        destination = LOCAL_KNOWLEDGE_DIR / f"{uuid4().hex}_{safe_name}"
+        shutil.copy2(source, destination)
+        copied.append(
+            {
+                "original_name": item.get("original_name") or source.name,
+                "path": str(destination.resolve()),
+                "knowledge_path": destination.relative_to(LOCAL_KNOWLEDGE_DIR).as_posix(),
+                "size_bytes": destination.stat().st_size,
+            }
+        )
+    return copied
+
+
+def _stream_agent_in_thread(
+    *,
+    user_input: str,
+    user_id: str,
+    session_id: str,
+    uploaded_files: list[str],
+    knowledge_base_path: str,
+    upload_workdir: str,
+    rag_index_dir: str,
+    workspace_settings: dict[str, Any],
+) -> Queue:
+    queue: Queue = Queue()
+
+    def worker() -> None:
+        try:
+            def forward_event(payload: dict[str, Any]) -> None:
+                queue.put(("event", ("custom", payload)))
+
+            for event in stream_agent(
+                user_input=user_input,
+                user_id=user_id,
+                session_id=session_id,
+                uploaded_files=uploaded_files,
+                knowledge_base_path=knowledge_base_path,
+                upload_workdir=upload_workdir,
+                rag_index_dir=rag_index_dir,
+                workspace_settings=workspace_settings,
+                event_callback=forward_event,
+            ):
+                queue.put(("event", event))
+            queue.put(("done", None))
+        except Exception as exc:
+            queue.put(("error", exc))
+
+    threading.Thread(target=worker, daemon=True).start()
+    return queue
+
+
+def _graph_event_to_sse(event: Any) -> tuple[str, dict[str, Any]] | None:
+    mode = ""
+    payload: Any = event
+    if isinstance(event, tuple) and len(event) == 2:
+        mode, payload = str(event[0]), event[1]
+
+    if mode == "custom" and isinstance(payload, dict):
+        status = str(payload.get("status") or "")
+        if status == "thought":
+            return "thought", payload
+        if status == "answer_start":
+            return "answer_start", payload
+        if status == "answer_delta":
+            return "answer_delta", payload
+        node = str(payload.get("node") or "")
+        if node:
+            return "status", {"stage": node, "message": status or node, **payload}
+    return None
 
 
 def _normalize_intent(agent_result: dict[str, Any], primary_node: str) -> str:
@@ -430,6 +482,14 @@ def _current_turn_step_records(agent_result: dict[str, Any]) -> list[dict[str, A
     return [
         item
         for item in list(agent_result.get("step_records") or [])
+        if isinstance(item, dict) and _is_current_turn_item(agent_result, item)
+    ]
+
+
+def _current_turn_llm_traces(agent_result: dict[str, Any]) -> list[dict[str, Any]]:
+    return [
+        item
+        for item in list(agent_result.get("llm_traces") or [])
         if isinstance(item, dict) and _is_current_turn_item(agent_result, item)
     ]
 
@@ -506,17 +566,28 @@ def _build_tool_result(agent_result: dict[str, Any]) -> tuple[dict[str, Any], st
         "artifacts": [],
         "observation": primary,
         "metrics": {"step_count": len(_current_turn_steps(agent_result))},
+        "meta": {},
     }
 
     if primary_node == "RAG" and isinstance(tool_results.get("rag"), dict):
         rag_result = tool_results["rag"]
+        tool_result["tool_name"] = str(rag_result.get("tool_name") or tool_result["tool_name"])
         tool_result["references"] = list(rag_result.get("references") or [])
+        tool_result["artifacts"] = list(rag_result.get("artifacts") or [])
+        tool_result["metrics"].update(dict(rag_result.get("metrics") or {}))
+        tool_result["meta"] = dict(rag_result.get("meta") or {})
         tool_result["retrieved_chunks"] = list(rag_result.get("chunks") or [])
         tool_result["grouped_results"] = list(rag_result.get("grouped_results") or [])
         tool_result["retrieval_trace"] = rag_result.get("retrieval_trace")
 
     elif primary_node == "WebSearch" and isinstance(tool_results.get("web_search"), dict):
-        raw_results = list(tool_results["web_search"].get("results") or [])
+        web_result = tool_results["web_search"]
+        tool_result["tool_name"] = str(web_result.get("tool_name") or tool_result["tool_name"])
+        tool_result["references"] = list(web_result.get("references") or [])
+        tool_result["artifacts"] = list(web_result.get("artifacts") or [])
+        tool_result["metrics"].update(dict(web_result.get("metrics") or {}))
+        tool_result["meta"] = dict(web_result.get("meta") or {})
+        raw_results = list(web_result.get("results") or [])
         web_results: list[dict[str, Any]] = []
         for index, item in enumerate(raw_results, start=1):
             if not isinstance(item, dict):
@@ -530,14 +601,18 @@ def _build_tool_result(agent_result: dict[str, Any]) -> tuple[dict[str, Any], st
         tool_result["results"] = web_results
         tool_result["web_search"] = {
             "results": web_results,
-            "possible_answer": str(tool_results["web_search"].get("answer") or ""),
+            "possible_answer": str(web_result.get("answer") or ""),
             "raw_results_count": len(raw_results),
             "retained_results_count": len(web_results),
         }
 
     elif primary_node == "scAnalysis" and isinstance(tool_results.get("sc_analysis"), dict):
         sc_result = tool_results["sc_analysis"]
+        tool_result["tool_name"] = str(sc_result.get("tool_name") or tool_result["tool_name"])
+        tool_result["references"] = list(sc_result.get("references") or [])
         tool_result["artifacts"] = list(sc_result.get("artifacts") or [])
+        tool_result["metrics"].update(dict(sc_result.get("metrics") or {}))
+        tool_result["meta"] = dict(sc_result.get("meta") or {})
         tool_result["pdf_report"] = sc_result.get("pdf_report")
         tool_result["analysis_result"] = sc_result.get("analysis_result")
         tool_result["report_context"] = sc_result.get("report_context")
@@ -557,13 +632,14 @@ def _build_agent_payload(agent_result: dict[str, Any], tool_result: dict[str, An
 
     intent = _normalize_intent(agent_result, primary_node)
     execution_steps = _build_execution_steps(agent_result)
+    llm_traces = _current_turn_llm_traces(agent_result)
 
     decision = {
         "intent": intent,
         "reason": f"当前流程结束于 {primary_node or 'FinalNode'}。",
         "selected_tools": selected_tools,
         "execution_steps": execution_steps,
-        "llm_traces": [],
+        "llm_traces": llm_traces,
         "tool_result": tool_result,
     }
     return {
@@ -805,25 +881,30 @@ async def submit_agent(
     session_root = _session_root(safe_user_id, safe_session_id)
     uploads_root = session_root / "uploads"
     converted_root = uploads_root / "converted"
-    rag_index_dir = session_root / "rag_index"
+    rag_index_dir = session_root / "tmp" / "rag_index"
     uploads_root.mkdir(parents=True, exist_ok=True)
     converted_root.mkdir(parents=True, exist_ok=True)
     rag_index_dir.mkdir(parents=True, exist_ok=True)
 
     saved_files = [_save_upload(upload, uploads_root) for upload in uploads]
-    uploaded_paths = [item["path"] for item in saved_files]
+    agent_uploaded_paths = [
+        item["path"]
+        for item in saved_files
+        if str(item.get("kind") or "") != "pdf"
+    ]
     effective_user_text = _build_effective_user_text(text, saved_files)
     workspace_settings = _load_workspace_settings(safe_user_id)
 
-    has_uploaded_rag_files = bool(saved_files)
+    has_uploaded_rag_files = any(_is_rag_upload_candidate(item) for item in saved_files)
+    has_session_rag_files = has_uploaded_rag_files or _has_session_rag_sources(uploads_root)
     knowledge_base_path = (
         str(uploads_root.resolve())
-        if has_uploaded_rag_files
+        if has_session_rag_files
         else str(LOCAL_KNOWLEDGE_DIR.resolve())
     )
     effective_rag_index_dir = (
         str(rag_index_dir.resolve())
-        if has_uploaded_rag_files
+        if has_session_rag_files
         else str(LOCAL_KNOWLEDGE_INDEX_DIR.resolve())
     )
 
@@ -848,20 +929,91 @@ async def submit_agent(
         )
 
         try:
-            agent_result = await asyncio.to_thread(
-                run_agent,
-                user_input=effective_user_text,
-                user_id=safe_user_id,
-                session_id=safe_session_id,
-                uploaded_files=uploaded_paths,
-                knowledge_base_path=knowledge_base_path,
-                upload_workdir=str(converted_root.resolve()),
-                rag_index_dir=effective_rag_index_dir,
-                workspace_settings=workspace_settings,
-            )
-            tool_result, primary_node = _build_tool_result(agent_result)
-            agent_payload = _build_agent_payload(agent_result, tool_result, primary_node)
-            assistant_text = str(tool_result.get("answer") or tool_result.get("message") or "").strip()
+            if _is_local_knowledge_upload_request(text) and any(item["kind"] == "pdf" for item in saved_files):
+                copied_files = _copy_uploaded_pdfs_to_local_knowledge(saved_files)
+                if copied_files:
+                    assistant_text = (
+                        f"已将 {len(copied_files)} 个 PDF 复制到本地知识库目录。"
+                        "需要重建本地知识库索引后，RAG 才会检索到这些文件。"
+                    )
+                    tool_result = {
+                        "status": "ok",
+                        "tool_name": "local_knowledge_upload",
+                        "answer": assistant_text,
+                        "message": assistant_text,
+                        "artifacts": [],
+                        "references": [],
+                        "metrics": {"copied_files": len(copied_files)},
+                        "meta": {
+                            "knowledge_base_path": str(LOCAL_KNOWLEDGE_DIR.resolve()),
+                            "files": copied_files,
+                            "index_rebuild_required": True,
+                        },
+                    }
+                else:
+                    assistant_text = "没有检测到可复制到本地知识库的 PDF 文件。"
+                    tool_result = {
+                        "status": "error",
+                        "tool_name": "local_knowledge_upload",
+                        "answer": assistant_text,
+                        "message": assistant_text,
+                        "artifacts": [],
+                        "references": [],
+                        "metrics": {"copied_files": 0},
+                        "meta": {"knowledge_base_path": str(LOCAL_KNOWLEDGE_DIR.resolve())},
+                    }
+                agent_payload = {
+                    "status": tool_result["status"],
+                    "answer": assistant_text,
+                    "tool_result": tool_result,
+                    "decision": {
+                        "intent": "local_knowledge_upload",
+                        "reason": "用户明确要求将上传 PDF 加入本地知识库。",
+                        "selected_tools": ["local_knowledge_upload"],
+                        "execution_steps": [],
+                    },
+                    "graph_execution": {
+                        "dispatched_node": "LocalKnowledgeUpload",
+                        "steps": [],
+                        "observations": [],
+                    },
+                }
+                yield _sse_event("answer_start", {"label": "开始生成回答"})
+                yield _sse_event("answer_delta", {"delta": assistant_text})
+            else:
+                event_queue = _stream_agent_in_thread(
+                    user_input=effective_user_text,
+                    user_id=safe_user_id,
+                    session_id=safe_session_id,
+                    uploaded_files=agent_uploaded_paths,
+                    knowledge_base_path=knowledge_base_path,
+                    upload_workdir=str(converted_root.resolve()),
+                    rag_index_dir=effective_rag_index_dir,
+                    workspace_settings=workspace_settings,
+                )
+
+                agent_result: dict[str, Any] | None = None
+                while True:
+                    kind, item = await asyncio.to_thread(event_queue.get)
+                    if kind == "error":
+                        raise item
+                    if kind == "done":
+                        break
+                    if kind != "event":
+                        continue
+                    if isinstance(item, tuple) and len(item) == 2 and item[0] == "final_state":
+                        agent_result = dict(item[1] or {})
+                        continue
+                    sse_event = _graph_event_to_sse(item)
+                    if sse_event is not None:
+                        yield _sse_event(sse_event[0], sse_event[1])
+
+                if agent_result is None:
+                    raise RuntimeError("Agent 未返回最终状态。")
+
+                tool_result, primary_node = _build_tool_result(agent_result)
+                agent_payload = _build_agent_payload(agent_result, tool_result, primary_node)
+                assistant_text = str(tool_result.get("answer") or tool_result.get("message") or "").strip()
 
             _append_session_history(
                 safe_user_id,
