@@ -114,7 +114,12 @@ export function formatTimestamp(value) {
 }
 
 export function formatReferenceLabel(reference, index) {
-  const parts = [`[${index + 1}]`, reference.file_name || '未知来源']
+  const sourcePath = String(reference.source_path || reference.url || '').trim()
+  const sourceName = sourcePath ? sourcePath.split(/[\\/]/).filter(Boolean).pop() : ''
+  const parts = [
+    `[${index + 1}]`,
+    reference.file_name || reference.metadata?.file_name || reference.title || sourceName || '未知来源',
+  ]
   if (reference.page !== null && reference.page !== undefined) {
     parts.push(`p.${reference.page}`)
   }
@@ -126,6 +131,11 @@ export function formatReferenceLabel(reference, index) {
 
 export function formatRouteIntent(value) {
   const labels = {
+    professional_qa: '专业知识问答',
+    non_professional_qa: '非专业问答',
+    sc_analysis: '单细胞分析',
+    deep_sc_analysis: '深入单细胞分析',
+    unclear: '未明确分类',
     general_chat: '通用对话',
     local_knowledge_qa: '本地知识库问答',
     web_search: '网页搜索',
@@ -170,10 +180,12 @@ export function buildRouteTraceModel(source) {
           label: String(item?.label || ''),
           decision: extractTraceDecision(item),
           selectedNode: formatRouteIntent(String(item?.parsed_node || item?.action || '')),
+          intentLabel: formatRouteIntent(String(item?.parsed_intent_type || item?.intent_type || '')),
           elapsedMs: item?.elapsed_ms,
         }))
-        .filter((item) => item.decision || item.selectedNode)
+        .filter((item) => item.decision || item.selectedNode || item.intentLabel)
     : []
+  const llmCallCount = Number(source.llm_call_count)
 
   if (
     !reason
@@ -181,7 +193,9 @@ export function buildRouteTraceModel(source) {
     && !executionSteps.length
     && !llmTraces.length
     && !source.intent
+    && !source.intent_type
     && !source.dispatched_node
+    && !Number.isFinite(llmCallCount)
   ) {
     return null
   }
@@ -191,8 +205,9 @@ export function buildRouteTraceModel(source) {
     selectedTools,
     executionSteps,
     llmTraces,
-    intentLabel: formatRouteIntent(String(source.intent || '')),
+    intentLabel: formatRouteIntent(String(source.intent_type || source.intent || '')),
     dispatchedLabel: formatRouteIntent(String(source.dispatched_node || '')),
+    llmCallCount: Number.isFinite(llmCallCount) ? llmCallCount : null,
   }
 }
 

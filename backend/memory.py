@@ -1,88 +1,48 @@
 from __future__ import annotations
 
 import atexit
-import configparser
+import hashlib
 import json
-import logging
 import os
 from dataclasses import dataclass
-from datetime import datetime
 from pathlib import Path
 from threading import Lock
 from typing import Any, Sequence
 from uuid import NAMESPACE_URL, uuid5
 
 import pymysql
-from langchain.agents.middleware import SummarizationMiddleware
-from langchain_core.language_models.chat_models import SimpleChatModel
-from langchain_core.messages import BaseMessage, HumanMessage, get_buffer_string
+from langchain_core.messages import HumanMessage, get_buffer_string
 from langgraph.checkpoint.redis import RedisSaver
-from langgraph.runtime import Runtime
 from pymysql.cursors import DictCursor
 
+from . import config as C
+from .util import (
+    DEFAULT_MEMORY_SCORE_THRESHOLD,
+    SHORT_ENTITY_MEMORY_SCORE_THRESHOLD,
+    compact_memory_text,
+    memory_query_features,
+    summarize_memory_turn,
+)
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 DATA_DIR = PROJECT_ROOT / "data" / "memory"
-SHORT_TERM_DIR = DATA_DIR / "short_term"
 LONG_TERM_DIR = DATA_DIR / "long_term"
 LONG_TERM_VECTOR_DIR = DATA_DIR / "long_term_vectors"
-MYSQL_CNF_PATH = Path(
-    os.getenv(
-        "AGENT_MEMORY_MYSQL_CNF",
-        str(Path.home() / "local" / "mysql" / "etc" / "my.cnf"),
-    )
-)
+LOCAL_BGE_MODEL = PROJECT_ROOT / "models" / "bge-m3"
 
+MYSQL_DATABASE = C.MYSQL_DATABASE
+MYSQL_USER = C.MYSQL_USER
+MYSQL_PASSWORD = C.MYSQL_PASSWORD
 REDIS_URL = os.getenv("REDIS_URL", "redis://127.0.0.1:6379/0")
 REDIS_TTL_MINUTES = int(os.getenv("AGENT_MEMORY_TTL_MINUTES", "1440"))
-DEFAULT_SUMMARY_TRIGGER = int(os.getenv("AGENT_SHORT_TERM_SUMMARY_TRIGGER", "24"))
-DEFAULT_KEEP_MESSAGES = int(os.getenv("AGENT_SHORT_TERM_KEEP_MESSAGES", "12"))
 DEFAULT_LONG_TERM_TOP_K = int(os.getenv("AGENT_LONG_TERM_TOP_K", "3"))
 LONG_TERM_VECTOR_COLLECTION = os.getenv("AGENT_MEMORY_VECTOR_COLLECTION", "long_term_memories")
-LONG_TERM_VECTOR_SCORE_THRESHOLD = float(os.getenv("AGENT_MEMORY_VECTOR_SCORE_THRESHOLD", "0.2"))
-LONG_TERM_VECTOR_REBUILD_LIMIT = int(os.getenv("AGENT_MEMORY_VECTOR_REBUILD_LIMIT", "5000"))
-MYSQL_DATABASE = os.getenv("AGENT_MEMORY_MYSQL_DB", "agent_memory")
-MYSQL_USER = os.getenv("AGENT_MEMORY_MYSQL_USER", "root")
-MYSQL_PASSWORD = os.getenv("AGENT_MEMORY_MYSQL_PASSWORD", "123456")
-LOCAL_BGE_MODEL = PROJECT_ROOT / "models" / "bge-m3"
-DEFAULT_MEMORY_EMBEDDING_MODEL = (
-    os.getenv("AGENT_MEMORY_EMBEDDING_MODEL_PATH")
-    or os.getenv("EMBEDDING_MODEL_PATH")
-    or (str(LOCAL_BGE_MODEL) if LOCAL_BGE_MODEL.exists() else "BAAI/bge-m3")
-)
+DEFAULT_MEMORY_EMBEDDING_MODEL = os.getenv("AGENT_MEMORY_EMBEDDING_MODEL_PATH") or os.getenv("EMBEDDING_MODEL_PATH") or (str(LOCAL_BGE_MODEL) if LOCAL_BGE_MODEL.exists() else "BAAI/bge-m3")
 
-SHORT_TERM_DIR.mkdir(parents=True, exist_ok=True)
 LONG_TERM_DIR.mkdir(parents=True, exist_ok=True)
 LONG_TERM_VECTOR_DIR.mkdir(parents=True, exist_ok=True)
-
-SUMMARY_PREFIX = "Here is a summary of the conversation to date:\n\n"
-LOGGER = logging.getLogger(__name__)
-_MEMORY_EMBEDDER_CACHE: dict[str, Any] = {}
-
-
-def _get_memory_embedder() -> Any:
-    cache_key = DEFAULT_MEMORY_EMBEDDING_MODEL
-    if cache_key in _MEMORY_EMBEDDER_CACHE:
-        return _MEMORY_EMBEDDER_CACHE[cache_key]
-
-    from sentence_transformers import SentenceTransformer
-
-    model = SentenceTransformer(DEFAULT_MEMORY_EMBEDDING_MODEL)
-    _MEMORY_EMBEDDER_CACHE[cache_key] = model
-    return model
-
-
-def _encode_memory_texts(texts: Sequence[str], *, batch_size: int = 16) -> list[list[float]]:
-    if not texts:
-        return []
-    model = _get_memory_embedder()
-    vectors = model.encode(
-        list(texts),
-        batch_size=batch_size,
-        normalize_embeddings=True,
-        show_progress_bar=False,
-    )
-    return [list(map(float, vector)) for vector in vectors]
+_EMBEDDER_CACHE: dict[str, Any] = {}
+_MEMORY_MANAGER: "MemoryManager | None" = None
 
 
 @dataclass(slots=True)
@@ -90,57 +50,35 @@ class LongTermMemoryHit:
     content: str
     score: float
     metadata: dict[str, Any]
+    summary: str = ""
+    tags: list[str] | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
             "content": self.content,
+            "summary": self.summary,
             "score": round(float(self.score), 4),
             "metadata": dict(self.metadata),
+            "tags": list(self.tags or []),
         }
 
 
-class LocalSummaryChatModel(SimpleChatModel):
-    model_path: str = "backend.tools.LLM.chat"
+def _get_embedder() -> Any:
+    if DEFAULT_MEMORY_EMBEDDING_MODEL not in _EMBEDDER_CACHE:
+        from sentence_transformers import SentenceTransformer
 
-    @property
-    def _llm_type(self) -> str:
-        return "local_summary_chat_model"
+        _EMBEDDER_CACHE[DEFAULT_MEMORY_EMBEDDING_MODEL] = SentenceTransformer(DEFAULT_MEMORY_EMBEDDING_MODEL)
+    return _EMBEDDER_CACHE[DEFAULT_MEMORY_EMBEDDING_MODEL]
 
-    @property
-    def _identifying_params(self) -> dict[str, Any]:
-        return {"model_path": self.model_path}
 
-    def _call(
-        self,
-        messages: list[BaseMessage],
-        stop: list[str] | None = None,
-        run_manager: Any | None = None,
-        **kwargs: Any,
-    ) -> str:
-        del stop, run_manager, kwargs
-        if len(messages) == 1 and isinstance(messages[0], HumanMessage):
-            prompt = str(messages[0].content)
-        else:
-            prompt = get_buffer_string(messages)
-
-        try:
-            from .tools import LLM as llm_module
-        except ImportError:
-            from tools import LLM as llm_module
-
-        return str(llm_module.chat(prompt=prompt)).strip()
+def _encode_texts(texts: Sequence[str], batch_size: int = 16) -> list[list[float]]:
+    vectors = _get_embedder().encode(list(texts), batch_size=batch_size, normalize_embeddings=True, show_progress_bar=False)
+    return [list(map(float, vector)) for vector in vectors]
 
 
 class MemoryManager:
     def __init__(self) -> None:
-        self.summary_model = LocalSummaryChatModel()
-        self.checkpointer = RedisSaver(
-            redis_url=REDIS_URL,
-            ttl={
-                "default_ttl": REDIS_TTL_MINUTES,
-                "refresh_on_read": True,
-            },
-        )
+        self.checkpointer = RedisSaver(redis_url=REDIS_URL, ttl={"default_ttl": REDIS_TTL_MINUTES, "refresh_on_read": True})
         self.checkpointer.setup()
         self._vector_lock = Lock()
         self._mysql_base_config = self._load_mysql_base_config()
@@ -153,60 +91,37 @@ class MemoryManager:
         user_id = str(state.get("user_id") or "anonymous")
         session_id = str(state.get("session_id") or "default")
         query = self._last_user_text(state)
-        workspace_settings = dict(state.get("workspace_settings") or {})
-
-        patch: dict[str, Any] = {
-            "memory_context": "",
-            "long_term_memories": [],
+        settings = dict(state.get("workspace_settings") or {})
+        top_k = int(settings.get("long_term_top_k", DEFAULT_LONG_TERM_TOP_K))
+        hits, filtered = ([], [])
+        if bool(settings.get("enable_semantic_memory", True)) and query.strip() and top_k > 0:
+            hits, filtered = self.search_long_term_memories_with_trace(user_id=user_id, session_id=session_id, query=query, top_k=top_k)
+        recent_rows = self._load_recent_session_rows(user_id=user_id, session_id=session_id, limit=max(8, top_k * 3))
+        recent_turns = self._select_recent_session_turns(query, recent_rows, limit=2)
+        session_summary = self._build_session_summary(query, recent_rows)
+        memory_sections = {
+            "current_user_query": query,
+            "retrieved_long_term_memory": [self._hit_prompt_item(hit) for hit in hits],
+            "session_summary": session_summary,
+            "recent_session_turns": recent_turns,
+            "tool_context": [],
+            "system_instruction": "Memory is auxiliary context only; current user query and current tool results have higher priority.",
         }
-
-        summary_patch = self._summarize_messages(
-            user_id=user_id,
-            session_id=session_id,
-            messages=list(state.get("messages") or []),
-            workspace_settings=workspace_settings,
-        )
-        if summary_patch:
-            patch["messages"] = summary_patch["messages"]
-
-        memory_context = self.load_long_term_context(
-            user_id=user_id,
-            session_id=session_id,
-            query=query,
-            top_k=int(workspace_settings.get("long_term_top_k", DEFAULT_LONG_TERM_TOP_K)),
-            enable_profile=bool(workspace_settings.get("enable_profile_memory", True)),
-            enable_semantic=bool(workspace_settings.get("enable_semantic_memory", True)),
-        )
-        patch["memory_context"] = memory_context["context"]
-        patch["long_term_memories"] = memory_context["hits"]
-        return patch
-
-    def load_long_term_context(
-        self,
-        *,
-        user_id: str,
-        session_id: str,
-        query: str,
-        top_k: int,
-        enable_profile: bool,
-        enable_semantic: bool,
-    ) -> dict[str, Any]:
-        profile = self._load_profile(user_id) if enable_profile else {}
-        hits: list[LongTermMemoryHit] = []
-        if enable_semantic and query.strip():
-            hits = self._search_long_term_memories(
-                user_id=user_id,
-                session_id=session_id,
-                query=query,
-                top_k=max(top_k, 0),
-            )
-
-        context = self._build_memory_context(profile, hits)
-        self._write_retrieval_snapshot(user_id, profile, hits, query)
+        memory_context = self._build_context(memory_sections)
+        memory_debug = {
+            "current_query": query,
+            "query_features": self._debug_query_features(query),
+            "selected_memories": [self._debug_hit(hit) for hit in hits],
+            "filtered_memories": filtered[:10],
+            "session_summary_categories": sorted(session_summary.keys()),
+            "recent_session_turn_count": len(recent_turns),
+            "final_prompt_memory_block": compact_memory_text(memory_context, 1200),
+        }
         return {
-            "context": context,
-            "profile": profile,
-            "hits": [hit.to_dict() for hit in hits],
+            "memory_context": memory_context,
+            "long_term_memories": [hit.to_dict() for hit in hits],
+            "memory_sections": memory_sections,
+            "memory_debug": memory_debug,
         }
 
     def store_turn(
@@ -219,199 +134,160 @@ class MemoryManager:
         state: dict[str, Any],
         workspace_settings: dict[str, Any] | None = None,
     ) -> None:
-        settings = dict(workspace_settings or {})
+        del workspace_settings
         if not final_answer.strip():
             return
+        summary, tags, memory_type = summarize_memory_turn(user_input, final_answer)
+        checksum = hashlib.sha256(json.dumps({"user_id": user_id, "session_id": session_id, "summary": summary, "tags": tags}, ensure_ascii=False, sort_keys=True).encode("utf-8")).hexdigest()
+        record = {
+            "user_id": user_id,
+            "session_id": session_id,
+            "memory_type": memory_type,
+            "content": summary,
+            "summary": summary,
+            "tags": tags,
+            "source_turn_id": str(state.get("current_turn_id") or ""),
+            "relevance": {"inject_only_when_relevant": True, "score_threshold": DEFAULT_MEMORY_SCORE_THRESHOLD},
+            "version": 1,
+            "checksum": checksum,
+            "metadata": {
+                "intent": str(state.get("intent") or ""),
+                "intent_type": str(state.get("intent_type") or ""),
+                "steps": list(state.get("steps") or []),
+                "tool_results": sorted(dict(state.get("tool_results") or {}).keys()),
+                "input_kind": str(state.get("input_kind") or ""),
+                "summary": summary,
+                "tags": tags,
+            },
+        }
+        record["id"] = self._insert_long_term_memory(record)
+        self._upsert_vector(record)
+        self._append_export(user_id, record)
+        self._invalidate_memory_cache(user_id=user_id, session_id=session_id, memory_type=memory_type)
 
-        if bool(settings.get("enable_profile_memory", True)):
-            profile_updates = self._extract_profile_updates(user_input, state)
-            if profile_updates:
-                self._upsert_profile(user_id, profile_updates)
-                self._write_profile_snapshot(user_id, self._load_profile(user_id))
+    def search_long_term_memories(self, *, user_id: str, session_id: str, query: str, top_k: int) -> list[LongTermMemoryHit]:
+        hits, _ = self.search_long_term_memories_with_trace(user_id=user_id, session_id=session_id, query=query, top_k=top_k)
+        return hits
 
-        if bool(settings.get("enable_semantic_memory", True)):
-            record = {
-                "user_id": user_id,
-                "session_id": session_id,
-                "memory_type": "conversation_turn",
-                "content": self._build_long_term_record(user_input, final_answer, state),
-                "metadata": {
-                    "intent": str(state.get("intent") or ""),
-                    "steps": list(state.get("steps") or []),
-                    "tool_results": sorted(dict(state.get("tool_results") or {}).keys()),
-                    "input_kind": str(state.get("input_kind") or ""),
-                },
-            }
-            record["id"] = self._insert_long_term_memory(record)
-            self._upsert_long_term_memory_vector(record)
-            self._append_long_term_export(user_id, record)
+    def search_long_term_memories_with_trace(self, *, user_id: str, session_id: str, query: str, top_k: int) -> tuple[list[LongTermMemoryHit], list[dict[str, Any]]]:
+        del session_id
+        query_vector = _encode_texts([query], batch_size=1)[0]
+        points = self._query_points(user_id=user_id, vector=query_vector, limit=max(top_k * 4, top_k + 4, 8))
+        candidate_ids: list[int] = []
+        scored_payloads: list[tuple[int, float, dict[str, Any]]] = []
+        for point in points:
+            payload = dict(getattr(point, "payload", None) or {})
+            memory_id = int(payload.get("memory_id") or 0)
+            if memory_id:
+                candidate_ids.append(memory_id)
+                scored_payloads.append((memory_id, float(getattr(point, "score", 0.0) or 0.0), payload))
+        rows = self._fetch_active_memory_rows(candidate_ids)
+        candidates: list[LongTermMemoryHit] = []
+        for memory_id, score, payload in scored_payloads:
+            row = rows.get(memory_id)
+            if not row:
+                metadata = self._metadata_from_payload(payload)
+                metadata.update({"memory_id": memory_id, "stale_vector_payload": True})
+                candidates.append(LongTermMemoryHit(content="", summary="", score=score, metadata=metadata, tags=[]))
+            else:
+                candidates.append(self._hit_from_row(row, score=score))
+        return self._filter_hits(query, candidates, top_k=top_k)
 
     def clear_session(self, user_id: str, session_id: str) -> int:
-        cleared = 0
         self.checkpointer.delete_thread(self.thread_id(user_id, session_id))
-        summary_dir = SHORT_TERM_DIR / user_id / session_id
-        if summary_dir.exists():
-            for path in summary_dir.rglob("*"):
-                if path.is_file():
-                    path.unlink()
-            for path in sorted(summary_dir.glob("**/*"), reverse=True):
-                if path.is_dir():
-                    path.rmdir()
-            if summary_dir.exists():
-                summary_dir.rmdir()
-            cleared += 1
-
         with self._connect_db() as connection:
             with connection.cursor() as cursor:
                 cursor.execute(
-                    "DELETE FROM long_term_memories WHERE user_id = %s AND session_id = %s",
+                    "UPDATE long_term_memories SET deleted_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP WHERE user_id = %s AND session_id = %s AND deleted_at IS NULL",
                     (user_id, session_id),
                 )
-                cleared += int(cursor.rowcount or 0)
-        self._delete_long_term_memory_vectors(user_id=user_id, session_id=session_id)
-        return cleared
+                deleted = int(cursor.rowcount or 0)
+        self._delete_vectors(user_id=user_id, session_id=session_id)
+        self._invalidate_memory_cache(user_id=user_id, session_id=session_id)
+        return deleted
 
     def clear_user(self, user_id: str) -> int:
-        cleared = 0
-        self._delete_long_term_memory_vectors(user_id=user_id)
-        sessions_dir = PROJECT_ROOT / "data" / "users" / user_id / "sessions"
-        if sessions_dir.exists():
-            for session_dir in sessions_dir.iterdir():
-                if session_dir.is_dir():
-                    cleared += self.clear_session(user_id, session_dir.name)
-
+        self._delete_vectors(user_id=user_id)
         with self._connect_db() as connection:
             with connection.cursor() as cursor:
                 cursor.execute(
-                    "DELETE FROM user_profiles WHERE user_id = %s",
+                    "UPDATE long_term_memories SET deleted_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP WHERE user_id = %s AND deleted_at IS NULL",
                     (user_id,),
                 )
-                cleared += int(cursor.rowcount or 0)
-                cursor.execute(
-                    "DELETE FROM long_term_memories WHERE user_id = %s",
-                    (user_id,),
-                )
-                cleared += int(cursor.rowcount or 0)
+                deleted = int(cursor.rowcount or 0)
+        self._invalidate_memory_cache(user_id=user_id)
+        return deleted
 
-        long_term_dir = LONG_TERM_DIR / user_id
-        if long_term_dir.exists():
-            for path in long_term_dir.rglob("*"):
-                if path.is_file():
-                    path.unlink()
-            for path in sorted(long_term_dir.glob("**/*"), reverse=True):
-                if path.is_dir():
-                    path.rmdir()
-            if long_term_dir.exists():
-                long_term_dir.rmdir()
-            cleared += 1
-        return cleared
+    def update_memory(self, *, memory_id: int, user_id: str, session_id: str | None = None, summary: str | None = None, tags: list[str] | None = None, memory_type: str | None = None) -> bool:
+        row = self._fetch_memory_row(memory_id=memory_id, user_id=user_id)
+        if not row:
+            return False
+        next_summary = summary if summary is not None else str(row.get("summary") or row.get("content") or "")
+        next_tags = tags if tags is not None else list(self._json_field(row.get("tags_json"), []))
+        next_type = memory_type or str(row.get("memory_type") or "conversation_summary")
+        checksum = hashlib.sha256(json.dumps({"user_id": user_id, "session_id": row.get("session_id"), "summary": next_summary, "tags": next_tags}, ensure_ascii=False, sort_keys=True).encode("utf-8")).hexdigest()
+        params: list[Any] = [next_type, next_summary, next_summary, json.dumps(next_tags, ensure_ascii=False), checksum, user_id, memory_id]
+        session_clause = ""
+        if session_id is not None:
+            session_clause = " AND session_id = %s"
+            params.append(session_id)
+        with self._connect_db() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    f"""
+                    UPDATE long_term_memories
+                    SET memory_type = %s, content = %s, summary = %s, tags_json = %s,
+                        checksum = %s, version = version + 1, updated_at = CURRENT_TIMESTAMP, deleted_at = NULL
+                    WHERE user_id = %s AND id = %s{session_clause}
+                    """,
+                    tuple(params),
+                )
+                updated = bool(cursor.rowcount)
+        if updated:
+            refreshed = self._fetch_memory_row(memory_id=memory_id, user_id=user_id)
+            if refreshed:
+                self._upsert_vector(self._record_from_row(refreshed))
+                self._invalidate_memory_cache(user_id=user_id, session_id=str(refreshed.get("session_id") or ""), memory_type=str(refreshed.get("memory_type") or ""))
+        return updated
+
+    def delete_memory(self, *, memory_id: int, user_id: str, session_id: str | None = None) -> bool:
+        row = self._fetch_memory_row(memory_id=memory_id, user_id=user_id)
+        params: list[Any] = [user_id, memory_id]
+        session_clause = ""
+        if session_id is not None:
+            session_clause = " AND session_id = %s"
+            params.append(session_id)
+        with self._connect_db() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    f"UPDATE long_term_memories SET deleted_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP WHERE user_id = %s AND id = %s AND deleted_at IS NULL{session_clause}",
+                    tuple(params),
+                )
+                deleted = bool(cursor.rowcount)
+        if deleted:
+            actual_session = str((row or {}).get("session_id") or session_id or "")
+            self._delete_vectors(user_id=user_id, session_id=actual_session or None, memory_ids=[memory_id])
+            self._invalidate_memory_cache(user_id=user_id, session_id=actual_session, memory_type=str((row or {}).get("memory_type") or ""))
+        return deleted
 
     def close(self) -> None:
         redis_client = getattr(self.checkpointer, "_redis", None)
-        if redis_client is None:
-            return
-        redis_client.close()
-        if getattr(redis_client, "connection_pool", None):
-            redis_client.connection_pool.disconnect()
-
-    def _summarize_messages(
-        self,
-        *,
-        user_id: str,
-        session_id: str,
-        messages: list[BaseMessage],
-        workspace_settings: dict[str, Any],
-    ) -> dict[str, Any] | None:
-        trigger_messages = max(
-            2,
-            int(
-                workspace_settings.get(
-                    "short_term_summary_threshold",
-                    DEFAULT_SUMMARY_TRIGGER,
-                )
-            ),
-        )
-        keep_messages = max(
-            1,
-            int(
-                workspace_settings.get(
-                    "short_term_max_messages",
-                    DEFAULT_KEEP_MESSAGES,
-                )
-            ),
-        )
-        middleware = SummarizationMiddleware(
-            self.summary_model,
-            trigger=("messages", trigger_messages),
-            keep=("messages", keep_messages),
-        )
-        patch = middleware.before_model(
-            {"messages": messages},
-            Runtime(),
-        )
-        if not patch:
-            return None
-
-        summary_text = self._extract_summary_text(patch.get("messages", []))
-        if summary_text:
-            self._write_short_term_summary(user_id, session_id, summary_text)
-        return patch
-
-    def _extract_summary_text(self, messages: list[Any]) -> str:
-        for message in messages:
-            content = getattr(message, "content", "")
-            additional_kwargs = getattr(message, "additional_kwargs", {}) or {}
-            if additional_kwargs.get("lc_source") != "summarization":
-                continue
-            text = str(content or "")
-            if text.startswith(SUMMARY_PREFIX):
-                return text[len(SUMMARY_PREFIX) :].strip()
-            return text.strip()
-        return ""
-
-    def _write_short_term_summary(self, user_id: str, session_id: str, summary: str) -> None:
-        summary_dir = SHORT_TERM_DIR / user_id / session_id
-        summary_dir.mkdir(parents=True, exist_ok=True)
-        (summary_dir / "summary.md").write_text(summary, encoding="utf-8")
+        if redis_client is not None:
+            redis_client.close()
+            if getattr(redis_client, "connection_pool", None):
+                redis_client.connection_pool.disconnect()
 
     def _load_mysql_base_config(self) -> dict[str, Any]:
-        parser = configparser.ConfigParser()
-        parser.read(MYSQL_CNF_PATH, encoding="utf-8")
-
-        client = parser["client"] if parser.has_section("client") else {}
-        mysql = parser["mysql"] if parser.has_section("mysql") else {}
-        mysqld = parser["mysqld"] if parser.has_section("mysqld") else {}
-
-        config: dict[str, Any] = {
+        return {
+            "host": C.MYSQL_HOST,
+            "port": C.MYSQL_PORT,
             "user": MYSQL_USER,
             "password": MYSQL_PASSWORD,
             "charset": "utf8mb4",
             "autocommit": True,
             "cursorclass": DictCursor,
+            "connect_timeout": 2,
         }
-
-        socket_path = os.getenv("AGENT_MEMORY_MYSQL_SOCKET", "").strip()
-        host = os.getenv(
-            "AGENT_MEMORY_MYSQL_HOST",
-            client.get("host", mysql.get("host", mysqld.get("bind-address", "127.0.0.1"))),
-        ).strip()
-        if host == "localhost":
-            host = "127.0.0.1"
-        port = int(
-            os.getenv(
-                "AGENT_MEMORY_MYSQL_PORT",
-                client.get("port", mysql.get("port", mysqld.get("port", "3306"))),
-            )
-        )
-
-        if socket_path:
-            if not Path(socket_path).exists():
-                raise FileNotFoundError(f"MySQL socket 不存在：{socket_path}")
-            config["unix_socket"] = socket_path
-        else:
-            config["host"] = host or "127.0.0.1"
-            config["port"] = port
-        return config
 
     def _connect_server(self):
         return pymysql.connect(**self._mysql_base_config)
@@ -423,616 +299,480 @@ class MemoryManager:
         with self._connect_server() as connection:
             with connection.cursor() as cursor:
                 cursor.execute(f"CREATE DATABASE IF NOT EXISTS `{MYSQL_DATABASE}` CHARACTER SET utf8mb4")
-
         with self._connect_db() as connection:
             with connection.cursor() as cursor:
-                cursor.execute(
-                    """
-                    CREATE TABLE IF NOT EXISTS user_profiles (
-                        user_id VARCHAR(128) NOT NULL,
-                        profile_key VARCHAR(128) NOT NULL,
-                        profile_value_json JSON NOT NULL,
-                        updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
-                            ON UPDATE CURRENT_TIMESTAMP,
-                        PRIMARY KEY (user_id, profile_key)
-                    ) CHARACTER SET utf8mb4
-                    """
-                )
-                cursor.execute(
-                    """
+                cursor.execute("""
                     CREATE TABLE IF NOT EXISTS long_term_memories (
                         id BIGINT NOT NULL AUTO_INCREMENT,
                         user_id VARCHAR(128) NOT NULL,
                         session_id VARCHAR(128) NOT NULL,
                         memory_type VARCHAR(64) NOT NULL,
                         content MEDIUMTEXT NOT NULL,
+                        summary TEXT NULL,
+                        tags_json JSON NULL,
                         metadata_json JSON NULL,
+                        source_turn_id VARCHAR(128) NULL,
+                        relevance_json JSON NULL,
+                        version INT NOT NULL DEFAULT 1,
+                        checksum CHAR(64) NULL,
                         created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                        updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+                        deleted_at TIMESTAMP NULL DEFAULT NULL,
                         PRIMARY KEY (id),
-                        INDEX idx_memories_user_created (user_id, created_at DESC),
-                        INDEX idx_memories_user_session_created (
-                            user_id,
-                            session_id,
-                            created_at DESC
-                        )
+                        INDEX idx_user_created (user_id, created_at DESC),
+                        INDEX idx_user_session_created (user_id, session_id, created_at DESC),
+                        INDEX idx_user_deleted_updated (user_id, deleted_at, updated_at),
+                        INDEX idx_user_session_deleted (user_id, session_id, deleted_at)
                     ) CHARACTER SET utf8mb4
-                    """
-                )
-
-    def _load_profile(self, user_id: str) -> dict[str, Any]:
-        with self._connect_db() as connection:
-            with connection.cursor() as cursor:
-                cursor.execute(
-                    "SELECT profile_key, profile_value_json FROM user_profiles WHERE user_id = %s",
-                    (user_id,),
-                )
-                rows = cursor.fetchall()
-        profile: dict[str, Any] = {}
-        for row in rows:
-            try:
-                profile[str(row["profile_key"])] = json.loads(row["profile_value_json"])
-            except Exception:
-                profile[str(row["profile_key"])] = row["profile_value_json"]
-        return profile
-
-    def _upsert_profile(self, user_id: str, updates: dict[str, Any]) -> None:
-        with self._connect_db() as connection:
-            with connection.cursor() as cursor:
-                for key, value in updates.items():
-                    cursor.execute(
-                        """
-                        INSERT INTO user_profiles (user_id, profile_key, profile_value_json)
-                        VALUES (%s, %s, %s)
-                        ON DUPLICATE KEY UPDATE
-                            profile_value_json = VALUES(profile_value_json)
-                        """,
-                        (user_id, key, json.dumps(value, ensure_ascii=False)),
-                    )
+                """)
+                self._ensure_memory_columns(cursor)
+                self._ensure_memory_indexes(cursor)
 
     def _insert_long_term_memory(self, record: dict[str, Any]) -> int:
         with self._connect_db() as connection:
             with connection.cursor() as cursor:
                 cursor.execute(
                     """
-                    INSERT INTO long_term_memories (
-                        user_id,
-                        session_id,
-                        memory_type,
-                        content,
-                        metadata_json
-                    )
-                    VALUES (%s, %s, %s, %s, %s)
+                    INSERT INTO long_term_memories
+                    (user_id, session_id, memory_type, content, summary, tags_json, metadata_json,
+                     source_turn_id, relevance_json, version, checksum)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                     """,
                     (
                         record["user_id"],
                         record["session_id"],
                         record["memory_type"],
                         record["content"],
+                        record.get("summary", ""),
+                        json.dumps(record.get("tags") or [], ensure_ascii=False),
                         json.dumps(record["metadata"], ensure_ascii=False),
+                        record.get("source_turn_id", ""),
+                        json.dumps(record.get("relevance") or {}, ensure_ascii=False),
+                        int(record.get("version") or 1),
+                        record.get("checksum", ""),
                     ),
                 )
                 return int(cursor.lastrowid or 0)
 
-    def _search_long_term_memories(
-        self,
-        *,
-        user_id: str,
-        session_id: str,
-        query: str,
-        top_k: int,
-    ) -> list[LongTermMemoryHit]:
-        if top_k <= 0:
-            return []
-
-        hits = self._search_long_term_memory_vectors(
-            user_id=user_id,
-            session_id=session_id,
-            query=query,
-            top_k=top_k,
+    def _ensure_memory_columns(self, cursor: Any) -> None:
+        cursor.execute(
+            "SELECT COLUMN_NAME FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_SCHEMA = %s AND TABLE_NAME = 'long_term_memories'",
+            (MYSQL_DATABASE,),
         )
-        if hits or self._has_long_term_memory_vectors(user_id):
-            return hits
+        columns = {str(row.get("COLUMN_NAME")) for row in cursor.fetchall() or []}
+        additions = {
+            "summary": "ALTER TABLE long_term_memories ADD COLUMN summary TEXT NULL AFTER content",
+            "tags_json": "ALTER TABLE long_term_memories ADD COLUMN tags_json JSON NULL AFTER summary",
+            "source_turn_id": "ALTER TABLE long_term_memories ADD COLUMN source_turn_id VARCHAR(128) NULL AFTER metadata_json",
+            "relevance_json": "ALTER TABLE long_term_memories ADD COLUMN relevance_json JSON NULL AFTER source_turn_id",
+            "version": "ALTER TABLE long_term_memories ADD COLUMN version INT NOT NULL DEFAULT 1 AFTER relevance_json",
+            "checksum": "ALTER TABLE long_term_memories ADD COLUMN checksum CHAR(64) NULL AFTER version",
+            "updated_at": "ALTER TABLE long_term_memories ADD COLUMN updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP AFTER created_at",
+            "deleted_at": "ALTER TABLE long_term_memories ADD COLUMN deleted_at TIMESTAMP NULL DEFAULT NULL AFTER updated_at",
+        }
+        for column, ddl in additions.items():
+            if column not in columns:
+                cursor.execute(ddl)
 
-        if self._rebuild_long_term_memory_vectors(user_id):
-            return self._search_long_term_memory_vectors(
-                user_id=user_id,
-                session_id=session_id,
-                query=query,
-                top_k=top_k,
-            )
-        return []
-
-    def _search_long_term_memory_vectors(
-        self,
-        *,
-        user_id: str,
-        session_id: str,
-        query: str,
-        top_k: int,
-    ) -> list[LongTermMemoryHit]:
-        del session_id
-        try:
-            query_vector = _encode_memory_texts([query], batch_size=1)[0]
-            points = self._query_long_term_memory_points(
-                user_id=user_id,
-                vector=query_vector,
-                limit=max(top_k * 4, top_k),
-            )
-        except Exception as exc:
-            LOGGER.warning("Long-term memory vector search failed: %s", exc)
-            return []
-
-        hits: list[LongTermMemoryHit] = []
-        for point in points:
-            score = float(getattr(point, "score", 0.0) or 0.0)
-            if score < LONG_TERM_VECTOR_SCORE_THRESHOLD:
-                continue
-            payload = dict(getattr(point, "payload", None) or {})
-            raw_metadata = payload.get("metadata_json") or "{}"
-            try:
-                metadata = json.loads(str(raw_metadata))
-            except Exception:
-                metadata = {}
-            metadata.update(
-                {
-                    "memory_id": payload.get("memory_id"),
-                    "session_id": payload.get("session_id", ""),
-                    "memory_type": payload.get("memory_type", ""),
-                    "created_at": payload.get("created_at", ""),
-                    "retrieval_source": "qdrant_vector",
-                }
-            )
-            content = str(payload.get("content") or "")
-            if not content:
-                continue
-            hits.append(LongTermMemoryHit(content=content, score=score, metadata=metadata))
-            if len(hits) >= top_k:
-                break
-        return hits
-
-    def _query_long_term_memory_points(
-        self,
-        *,
-        user_id: str,
-        vector: Sequence[float],
-        limit: int,
-    ) -> list[Any]:
-        from qdrant_client import models
-
-        query_filter = models.Filter(
-            must=[
-                models.FieldCondition(
-                    key="user_id",
-                    match=models.MatchValue(value=user_id),
-                )
-            ]
+    def _ensure_memory_indexes(self, cursor: Any) -> None:
+        cursor.execute(
+            "SELECT INDEX_NAME FROM INFORMATION_SCHEMA.STATISTICS WHERE TABLE_SCHEMA = %s AND TABLE_NAME = 'long_term_memories'",
+            (MYSQL_DATABASE,),
         )
-        with self._vector_lock:
-            client = self._get_long_term_vector_client()
-            try:
-                response = client.query_points(
-                    collection_name=LONG_TERM_VECTOR_COLLECTION,
-                    query=list(vector),
-                    query_filter=query_filter,
-                    limit=limit,
-                    with_payload=True,
-                )
-                return list(getattr(response, "points", response))
-            except Exception as exc:
-                legacy_search = getattr(client, "search", None)
-                if not callable(legacy_search):
-                    raise exc
-                return list(
-                    legacy_search(
-                        collection_name=LONG_TERM_VECTOR_COLLECTION,
-                        query_vector=list(vector),
-                        query_filter=query_filter,
-                        limit=limit,
-                        with_payload=True,
-                    )
-                )
-            finally:
-                self._close_long_term_vector_client(client)
+        indexes = {str(row.get("INDEX_NAME")) for row in cursor.fetchall() or []}
+        if "idx_user_deleted_updated" not in indexes:
+            cursor.execute("CREATE INDEX idx_user_deleted_updated ON long_term_memories (user_id, deleted_at, updated_at)")
+        if "idx_user_session_deleted" not in indexes:
+            cursor.execute("CREATE INDEX idx_user_session_deleted ON long_term_memories (user_id, session_id, deleted_at)")
 
-    def _upsert_long_term_memory_vector(self, record: dict[str, Any]) -> None:
-        content = str(record.get("content") or "").strip()
-        if not content:
-            return
-        try:
-            vector = _encode_memory_texts([content], batch_size=1)[0]
-            self._ensure_long_term_vector_collection(len(vector))
-            from qdrant_client import models
-
-            metadata = dict(record.get("metadata") or {})
-            payload = {
-                "memory_id": int(record.get("id") or 0),
-                "user_id": str(record.get("user_id") or ""),
-                "session_id": str(record.get("session_id") or ""),
-                "memory_type": str(record.get("memory_type") or ""),
-                "content": content,
-                "metadata_json": json.dumps(metadata, ensure_ascii=False),
-                "created_at": self._now_iso(),
-            }
-            point_id = self._long_term_memory_point_id(payload)
-            with self._vector_lock:
-                client = self._get_long_term_vector_client()
-                try:
-                    client.upsert(
-                        collection_name=LONG_TERM_VECTOR_COLLECTION,
-                        points=[
-                            models.PointStruct(
-                                id=point_id,
-                                vector=vector,
-                                payload=payload,
-                            )
-                        ],
-                    )
-                finally:
-                    self._close_long_term_vector_client(client)
-        except Exception as exc:
-            LOGGER.warning("Long-term memory vector upsert failed: %s", exc)
-
-    def _rebuild_long_term_memory_vectors(self, user_id: str) -> bool:
+    def _load_recent_session_rows(self, *, user_id: str, session_id: str, limit: int) -> list[dict[str, Any]]:
         with self._connect_db() as connection:
             with connection.cursor() as cursor:
                 cursor.execute(
                     """
-                    SELECT id, user_id, session_id, memory_type, content, metadata_json, created_at
+                    SELECT id, user_id, session_id, memory_type, content, summary, tags_json,
+                           metadata_json, source_turn_id, relevance_json, version, checksum,
+                           created_at, updated_at, deleted_at
                     FROM long_term_memories
-                    WHERE user_id = %s
-                    ORDER BY created_at DESC
+                    WHERE user_id = %s AND session_id = %s AND deleted_at IS NULL
+                    ORDER BY updated_at DESC, created_at DESC
                     LIMIT %s
                     """,
-                    (user_id, LONG_TERM_VECTOR_REBUILD_LIMIT),
+                    (user_id, session_id, int(limit)),
                 )
-                rows = cursor.fetchall()
+                return list(cursor.fetchall() or [])
 
-        if not rows:
-            return False
+    def _fetch_memory_row(self, *, memory_id: int, user_id: str) -> dict[str, Any] | None:
+        with self._connect_db() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    """
+                    SELECT id, user_id, session_id, memory_type, content, summary, tags_json,
+                           metadata_json, source_turn_id, relevance_json, version, checksum,
+                           created_at, updated_at, deleted_at
+                    FROM long_term_memories
+                    WHERE id = %s AND user_id = %s
+                    LIMIT 1
+                    """,
+                    (memory_id, user_id),
+                )
+                return cursor.fetchone()
 
-        records: list[dict[str, Any]] = []
-        for row in reversed(rows):
-            content = str(row.get("content") or "").strip()
-            if not content:
+    def _fetch_active_memory_rows(self, memory_ids: list[int]) -> dict[int, dict[str, Any]]:
+        ids = [int(item) for item in memory_ids if int(item or 0) > 0]
+        if not ids:
+            return {}
+        placeholders = ", ".join(["%s"] * len(ids))
+        with self._connect_db() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    f"""
+                    SELECT id, user_id, session_id, memory_type, content, summary, tags_json,
+                           metadata_json, source_turn_id, relevance_json, version, checksum,
+                           created_at, updated_at, deleted_at
+                    FROM long_term_memories
+                    WHERE id IN ({placeholders}) AND deleted_at IS NULL
+                    """,
+                    tuple(ids),
+                )
+                return {int(row["id"]): row for row in cursor.fetchall() or []}
+
+    def _record_from_row(self, row: dict[str, Any]) -> dict[str, Any]:
+        metadata = self._json_field(row.get("metadata_json"), {})
+        tags = self._json_field(row.get("tags_json"), metadata.get("tags") or [])
+        return {
+            "id": int(row.get("id") or 0),
+            "user_id": str(row.get("user_id") or ""),
+            "session_id": str(row.get("session_id") or ""),
+            "memory_type": str(row.get("memory_type") or ""),
+            "content": str(row.get("content") or ""),
+            "summary": str(row.get("summary") or metadata.get("summary") or ""),
+            "tags": list(tags),
+            "metadata": dict(metadata),
+            "source_turn_id": str(row.get("source_turn_id") or ""),
+            "relevance": self._json_field(row.get("relevance_json"), {}),
+            "version": int(row.get("version") or 1),
+            "checksum": str(row.get("checksum") or ""),
+            "created_at": str(row.get("created_at") or ""),
+            "updated_at": str(row.get("updated_at") or ""),
+            "deleted_at": str(row.get("deleted_at") or ""),
+        }
+
+    def _hit_from_row(self, row: dict[str, Any], *, score: float) -> LongTermMemoryHit:
+        record = self._record_from_row(row)
+        metadata = dict(record["metadata"])
+        metadata.update({
+            "memory_id": record["id"],
+            "session_id": record["session_id"],
+            "memory_type": record["memory_type"],
+            "source_turn_id": record["source_turn_id"],
+            "checksum": record["checksum"],
+            "tags": record["tags"],
+            "created_at": record["created_at"],
+            "updated_at": record["updated_at"],
+            "retrieval_source": "qdrant_vector",
+        })
+        return LongTermMemoryHit(content=record["content"], summary=record["summary"], score=score, metadata=metadata, tags=record["tags"])
+
+    def _metadata_from_payload(self, payload: dict[str, Any]) -> dict[str, Any]:
+        metadata = self._json_field(payload.get("metadata_json"), {})
+        metadata.update({
+            "session_id": payload.get("session_id", ""),
+            "memory_type": payload.get("memory_type", ""),
+            "tags": self._json_field(payload.get("tags_json"), []),
+            "checksum": payload.get("checksum", ""),
+            "retrieval_source": "qdrant_vector",
+        })
+        return metadata
+
+    def _filter_hits(self, query: str, hits: list[LongTermMemoryHit], *, top_k: int) -> tuple[list[LongTermMemoryHit], list[dict[str, Any]]]:
+        query_features = memory_query_features(query)
+        substantive_query_tags = query_features["tags"] - {"general", "user_preferences", "task_state"}
+        selected: list[LongTermMemoryHit] = []
+        filtered: list[dict[str, Any]] = []
+        seen: set[str] = set()
+        for hit in sorted(hits, key=lambda item: item.score, reverse=True):
+            display_text = self._display_memory_text(hit)
+            hit_features = memory_query_features(f"{display_text} {hit.content}")
+            hit_tags = set(hit.tags or hit.metadata.get("tags") or [])
+            hit_tags.update(hit_features["tags"])
+            substantive_hit_tags = hit_tags - {"general", "user_preferences", "task_state"}
+            exact_entity = bool(query_features["entities"] and any(entity in hit_features["normalized"] for entity in query_features["entities"]))
+            token_overlap = bool(query_features["tokens"] & hit_features["tokens"])
+            topic_overlap = bool(substantive_query_tags & substantive_hit_tags)
+            entity_mismatch = bool(query_features["entities"] and hit_features["entities"] and not exact_entity)
+            checksum = str(hit.metadata.get("checksum") or hashlib.sha256(display_text.lower().encode("utf-8")).hexdigest())
+            reason = ""
+            if checksum in seen:
+                reason = "duplicate"
+            elif not display_text:
+                reason = "deleted_or_empty_memory"
+            elif query_features["is_short_entity"] and not exact_entity:
+                reason = "short_query_without_exact_entity_match"
+            elif entity_mismatch and hit.score < 0.82:
+                reason = "entity_mismatch_without_high_semantic_match"
+            elif hit.score < DEFAULT_MEMORY_SCORE_THRESHOLD and not exact_entity:
+                reason = f"below_threshold:{hit.score:.3f}<{DEFAULT_MEMORY_SCORE_THRESHOLD:.3f}"
+            elif query_features["is_short_entity"] and hit.score < SHORT_ENTITY_MEMORY_SCORE_THRESHOLD and not exact_entity:
+                reason = f"short_query_below_threshold:{hit.score:.3f}<{SHORT_ENTITY_MEMORY_SCORE_THRESHOLD:.3f}"
+            elif not (exact_entity or token_overlap or topic_overlap or hit.score >= max(0.72, DEFAULT_MEMORY_SCORE_THRESHOLD + 0.12)):
+                reason = "no_lexical_topic_or_high_semantic_match"
+            if reason:
+                filtered.append(self._debug_hit(hit, reason=reason))
                 continue
-            raw_metadata = row.get("metadata_json") or "{}"
-            try:
-                metadata = json.loads(raw_metadata)
-            except Exception:
-                metadata = {}
-            records.append(
-                {
-                    "id": int(row.get("id") or 0),
-                    "user_id": str(row.get("user_id") or ""),
-                    "session_id": str(row.get("session_id") or ""),
-                    "memory_type": str(row.get("memory_type") or ""),
-                    "content": content,
-                    "metadata": metadata,
-                    "created_at": str(row.get("created_at") or ""),
-                }
-            )
-        if not records:
-            return False
+            seen.add(checksum)
+            selected.append(LongTermMemoryHit(content=display_text, summary=hit.summary or display_text, score=hit.score, metadata=hit.metadata, tags=sorted(hit_tags)))
+            if len(selected) >= top_k:
+                break
+        return selected, filtered
 
-        try:
-            batch_size = 64
-            first_vector = _encode_memory_texts([records[0]["content"]], batch_size=1)[0]
-            self._ensure_long_term_vector_collection(len(first_vector))
+    def _select_recent_session_turns(self, query: str, rows: list[dict[str, Any]], *, limit: int) -> list[dict[str, Any]]:
+        hits = [self._hit_from_row(row, score=1.0) for row in rows]
+        selected, _ = self._filter_hits(query, hits, top_k=limit)
+        return [self._hit_prompt_item(hit) for hit in selected]
 
-            from qdrant_client import models
+    def _build_session_summary(self, query: str, rows: list[dict[str, Any]]) -> dict[str, list[str]]:
+        query_features = memory_query_features(query)
+        substantive_query_tags = query_features["tags"] - {"general", "user_preferences", "task_state"}
+        summary: dict[str, list[str]] = {}
+        for row in rows:
+            text = str(row.get("summary") or row.get("content") or "")
+            if not text:
+                continue
+            text_features = memory_query_features(text)
+            exact_entity = bool(query_features["entities"] and any(entity in text_features["normalized"] for entity in query_features["entities"]))
+            substantive_text_tags = text_features["tags"] - {"general", "user_preferences", "task_state"}
+            if query_features["entities"] and text_features["entities"] and not exact_entity:
+                continue
+            if query_features["is_short_entity"] and not exact_entity:
+                continue
+            if not query_features["is_short_entity"] and not (substantive_query_tags & substantive_text_tags or exact_entity):
+                continue
+            categories = []
+            if "user_preferences" in text_features["tags"]:
+                categories.append("user_preferences")
+            if "task_state" in text_features["tags"]:
+                categories.append("task_state")
+            if "bioinfo" in text_features["tags"]:
+                categories.append("bioinfo_context")
+            if "coding" in text_features["tags"]:
+                categories.append("coding_context")
+            if exact_entity:
+                categories.append("entities")
+            for category in categories:
+                summary.setdefault(category, [])
+                item = compact_memory_text(text, 220)
+                if item not in summary[category] and len(summary[category]) < 3:
+                    summary[category].append(item)
+        return summary
 
-            first_point = models.PointStruct(
-                id=self._long_term_memory_point_id(records[0]),
-                vector=first_vector,
-                payload=self._long_term_memory_payload(records[0]),
-            )
-            with self._vector_lock:
-                client = self._get_long_term_vector_client()
-                try:
-                    client.upsert(collection_name=LONG_TERM_VECTOR_COLLECTION, points=[first_point])
-                finally:
-                    self._close_long_term_vector_client(client)
-
-            for start in range(1, len(records), batch_size):
-                batch = records[start : start + batch_size]
-                vectors = _encode_memory_texts(
-                    [str(record.get("content") or "") for record in batch],
-                    batch_size=16,
-                )
-                points = [
-                    models.PointStruct(
-                        id=self._long_term_memory_point_id(record),
-                        vector=vector,
-                        payload=self._long_term_memory_payload(record),
-                    )
-                    for record, vector in zip(batch, vectors)
-                ]
-                with self._vector_lock:
-                    client = self._get_long_term_vector_client()
-                    try:
-                        client.upsert(collection_name=LONG_TERM_VECTOR_COLLECTION, points=points)
-                    finally:
-                        self._close_long_term_vector_client(client)
-            return True
-        except Exception as exc:
-            LOGGER.warning("Long-term memory vector rebuild failed: %s", exc)
-            return False
-
-    def _has_long_term_memory_vectors(self, user_id: str) -> bool:
-        try:
-            from qdrant_client import models
-
-            query_filter = models.Filter(
-                must=[
-                    models.FieldCondition(
-                        key="user_id",
-                        match=models.MatchValue(value=user_id),
-                    )
-                ]
-            )
-            with self._vector_lock:
-                client = self._get_long_term_vector_client()
-                try:
-                    result = client.count(
-                        collection_name=LONG_TERM_VECTOR_COLLECTION,
-                        count_filter=query_filter,
-                        exact=False,
-                    )
-                finally:
-                    self._close_long_term_vector_client(client)
-            return int(getattr(result, "count", 0) or 0) > 0
-        except Exception:
-            return False
-
-    def _delete_long_term_memory_vectors(self, *, user_id: str, session_id: str | None = None) -> None:
-        try:
-            from qdrant_client import models
-
-            must = [
-                models.FieldCondition(
-                    key="user_id",
-                    match=models.MatchValue(value=user_id),
-                )
-            ]
-            if session_id is not None:
-                must.append(
-                    models.FieldCondition(
-                        key="session_id",
-                        match=models.MatchValue(value=session_id),
-                    )
-            )
-            with self._vector_lock:
-                client = self._get_long_term_vector_client()
-                try:
-                    client.delete(
-                        collection_name=LONG_TERM_VECTOR_COLLECTION,
-                        points_selector=models.FilterSelector(filter=models.Filter(must=must)),
-                    )
-                finally:
-                    self._close_long_term_vector_client(client)
-        except Exception as exc:
-            LOGGER.warning("Long-term memory vector delete failed: %s", exc)
-
-    def _get_long_term_vector_client(self) -> Any:
+    def _get_vector_client(self) -> Any:
         from qdrant_client import QdrantClient
 
         LONG_TERM_VECTOR_DIR.mkdir(parents=True, exist_ok=True)
         return QdrantClient(path=str(LONG_TERM_VECTOR_DIR))
 
-    def _ensure_long_term_vector_collection(self, vector_size: int) -> None:
+    def _ensure_vector_collection(self, vector_size: int) -> None:
         from qdrant_client import models
 
         with self._vector_lock:
-            client = self._get_long_term_vector_client()
-            try:
-                client.get_collection(collection_name=LONG_TERM_VECTOR_COLLECTION)
+            client = self._get_vector_client()
+            collections = [item.name for item in client.get_collections().collections]
+            if LONG_TERM_VECTOR_COLLECTION not in collections:
+                client.create_collection(collection_name=LONG_TERM_VECTOR_COLLECTION, vectors_config=models.VectorParams(size=vector_size, distance=models.Distance.COSINE))
+            client.close()
+
+    def _upsert_vector(self, record: dict[str, Any]) -> None:
+        from qdrant_client import models
+
+        vector_text = str(record.get("summary") or record.get("content") or "")
+        if not vector_text.strip():
+            return
+        vector = _encode_texts([vector_text], batch_size=1)[0]
+        self._ensure_vector_collection(len(vector))
+        with self._vector_lock:
+            client = self._get_vector_client()
+            client.upsert(collection_name=LONG_TERM_VECTOR_COLLECTION, points=[models.PointStruct(id=self._point_id(record), vector=vector, payload=self._payload(record))])
+            client.close()
+
+    def _query_points(self, *, user_id: str, vector: Sequence[float], limit: int) -> list[Any]:
+        from qdrant_client import models
+
+        query_filter = models.Filter(must=[models.FieldCondition(key="user_id", match=models.MatchValue(value=user_id))])
+        with self._vector_lock:
+            client = self._get_vector_client()
+            collections = [item.name for item in client.get_collections().collections]
+            if LONG_TERM_VECTOR_COLLECTION not in collections:
+                client.close()
+                return []
+            result = client.query_points(collection_name=LONG_TERM_VECTOR_COLLECTION, query=list(vector), query_filter=query_filter, limit=limit, with_payload=True)
+            client.close()
+        return list(getattr(result, "points", result))
+
+    def _delete_vectors(self, *, user_id: str, session_id: str | None = None, memory_ids: list[int] | None = None) -> None:
+        from qdrant_client import models
+
+        must = [models.FieldCondition(key="user_id", match=models.MatchValue(value=user_id))]
+        if session_id is not None:
+            must.append(models.FieldCondition(key="session_id", match=models.MatchValue(value=session_id)))
+        if memory_ids:
+            must.append(models.FieldCondition(key="memory_id", match=models.MatchAny(any=[int(item) for item in memory_ids])))
+        with self._vector_lock:
+            client = self._get_vector_client()
+            collections = [item.name for item in client.get_collections().collections]
+            if LONG_TERM_VECTOR_COLLECTION not in collections:
+                client.close()
                 return
-            except Exception:
-                client.create_collection(
-                    collection_name=LONG_TERM_VECTOR_COLLECTION,
-                    vectors_config=models.VectorParams(
-                        size=vector_size,
-                        distance=models.Distance.COSINE,
-                    ),
-                )
-            finally:
-                self._close_long_term_vector_client(client)
+            client.delete(collection_name=LONG_TERM_VECTOR_COLLECTION, points_selector=models.FilterSelector(filter=models.Filter(must=must)))
+            client.close()
 
-    def _close_long_term_vector_client(self, client: Any) -> None:
-        close = getattr(client, "close", None)
-        if callable(close):
-            close()
+    def _point_id(self, record: dict[str, Any]) -> str:
+        key = f"{MYSQL_DATABASE}:{record.get('id') or record.get('memory_id') or record.get('content')}"
+        return str(uuid5(NAMESPACE_URL, key))
 
-    def _long_term_memory_payload(self, record: dict[str, Any]) -> dict[str, Any]:
+    def _payload(self, record: dict[str, Any]) -> dict[str, Any]:
         return {
             "memory_id": int(record.get("id") or 0),
             "user_id": str(record.get("user_id") or ""),
             "session_id": str(record.get("session_id") or ""),
             "memory_type": str(record.get("memory_type") or ""),
             "content": str(record.get("content") or ""),
+            "summary": str(record.get("summary") or ""),
+            "tags_json": json.dumps(record.get("tags") or [], ensure_ascii=False),
             "metadata_json": json.dumps(dict(record.get("metadata") or {}), ensure_ascii=False),
-            "created_at": str(record.get("created_at") or self._now_iso()),
+            "source_turn_id": str(record.get("source_turn_id") or ""),
+            "relevance_json": json.dumps(record.get("relevance") or {}, ensure_ascii=False),
+            "version": int(record.get("version") or 1),
+            "checksum": str(record.get("checksum") or ""),
         }
 
-    def _long_term_memory_point_id(self, record: dict[str, Any]) -> str:
-        memory_id = int(record.get("memory_id") or record.get("id") or 0)
-        if memory_id:
-            key = f"{MYSQL_DATABASE}:{memory_id}"
-        else:
-            key = "::".join(
-                [
-                    str(record.get("user_id") or ""),
-                    str(record.get("session_id") or ""),
-                    str(record.get("memory_type") or ""),
-                    str(record.get("content") or ""),
-                ]
-            )
-        return str(uuid5(NAMESPACE_URL, key))
-
-    def _build_memory_context(
-        self,
-        profile: dict[str, Any],
-        hits: list[LongTermMemoryHit],
-    ) -> str:
-        sections: list[str] = []
-        if profile:
-            lines = []
-            for key, value in profile.items():
-                lines.append(f"- {key}: {json.dumps(value, ensure_ascii=False)}")
-            sections.append("用户长期画像:\n" + "\n".join(lines))
-
-        if hits:
-            lines = []
-            for index, hit in enumerate(hits, start=1):
-                lines.append(
-                    f"{index}. [score={round(hit.score, 3)}] {self._truncate_text(hit.content, 280)}"
-                )
-            sections.append("相关长期记忆:\n" + "\n".join(lines))
-
-        return "\n\n".join(sections).strip()
-
-    def _current_turn_id(self, state: dict[str, Any]) -> str:
-        return str(state.get("current_turn_id") or "")
-
-    def _is_current_turn_item(self, state: dict[str, Any], item: dict[str, Any]) -> bool:
-        turn_id = self._current_turn_id(state)
-        if not turn_id:
-            return True
-        metadata = item.get("metadata")
-        if isinstance(metadata, dict):
-            return str(metadata.get("turn_id") or "") == turn_id
-        return str(item.get("turn_id") or "") == turn_id
-
-    def _current_turn_observations(self, state: dict[str, Any]) -> list[dict[str, Any]]:
-        return [
-            item
-            for item in list(state.get("observations") or [])
-            if isinstance(item, dict) and self._is_current_turn_item(state, item)
-        ]
-
-    def _current_turn_tool_results(self, state: dict[str, Any]) -> dict[str, Any]:
-        current = state.get("current_tool_results")
-        if (
-            isinstance(current, dict)
-            and str(state.get("current_tool_results_turn_id") or "") == self._current_turn_id(state)
-        ):
-            return dict(current)
-        if self._current_turn_id(state):
-            return {}
-        return dict(state.get("tool_results") or {})
-
-    def _build_long_term_record(
-        self,
-        user_input: str,
-        final_answer: str,
-        state: dict[str, Any],
-    ) -> str:
-        lines = [
-            f"用户问题: {user_input.strip()}",
-            f"最终回答: {final_answer.strip()}",
-        ]
-        intent = str(state.get("intent") or "").strip()
-        if intent:
-            lines.append(f"意图: {intent}")
-        tool_results = sorted(self._current_turn_tool_results(state).keys())
-        if tool_results:
-            lines.append(f"涉及工具: {', '.join(tool_results)}")
-        observations = self._current_turn_observations(state)
-        if observations:
-            latest = observations[-1]
-            latest_content = str(latest.get("content") or latest.get("error") or "").strip()
-            if latest_content:
-                lines.append(f"最近观察: {self._truncate_text(latest_content, 320)}")
-        return "\n".join(lines).strip()
-
-    def _extract_profile_updates(
-        self,
-        user_input: str,
-        state: dict[str, Any],
-    ) -> dict[str, Any]:
-        text = user_input.strip()
-        if not text:
-            return {}
-        updates: dict[str, Any] = {}
-        lowered = text.lower()
-        if any(token in text for token in ("中文", "汉语")):
-            updates["preferred_language"] = "zh"
-        if any(token in lowered for token in ("english", "英文")):
-            updates["preferred_language"] = "en"
-        if any(token in text for token in ("单细胞", "scgpt", "h5ad")):
-            updates["domain_focus"] = "single_cell_analysis"
-        if any(token in lowered for token in ("记住", "偏好", "默认", "prefer", "remember", "always")):
-            updates["user_preference"] = text
-        selected_tools = sorted(self._current_turn_tool_results(state).keys())
-        if selected_tools:
-            updates["last_selected_tools"] = selected_tools
-        return updates
-
-    def _append_long_term_export(self, user_id: str, record: dict[str, Any]) -> None:
-        user_dir = LONG_TERM_DIR / user_id
-        user_dir.mkdir(parents=True, exist_ok=True)
-        path = user_dir / "turns.jsonl"
-        export_record = {
-            **record,
-            "created_at": self._now_iso(),
-        }
+    def _append_export(self, user_id: str, record: dict[str, Any]) -> None:
+        path = LONG_TERM_DIR / user_id / "long_term_memories.jsonl"
+        path.parent.mkdir(parents=True, exist_ok=True)
         with path.open("a", encoding="utf-8") as handle:
-            handle.write(json.dumps(export_record, ensure_ascii=False) + "\n")
+            handle.write(json.dumps(record, ensure_ascii=False, default=str) + "\n")
 
-    def _write_profile_snapshot(self, user_id: str, profile: dict[str, Any]) -> None:
-        user_dir = LONG_TERM_DIR / user_id
-        user_dir.mkdir(parents=True, exist_ok=True)
-        (user_dir / "profile.json").write_text(
-            json.dumps(profile, ensure_ascii=False, indent=2),
-            encoding="utf-8",
-        )
+    def _invalidate_memory_cache(self, *, user_id: str, session_id: str | None = None, memory_type: str | None = None) -> None:
+        redis_client = getattr(self.checkpointer, "_redis", None)
+        if redis_client is None:
+            return
+        patterns = [
+            f"agent_memory_cache:{user_id}:*",
+            f"agent_memory_cache:{user_id}:{session_id or '*'}:*",
+            f"agent_memory_cache:{user_id}:{session_id or '*'}:{memory_type or '*'}:*",
+        ]
+        for pattern in patterns:
+            keys = list(redis_client.scan_iter(match=pattern, count=100))
+            if keys:
+                redis_client.delete(*keys)
 
-    def _write_retrieval_snapshot(
-        self,
-        user_id: str,
-        profile: dict[str, Any],
-        hits: list[LongTermMemoryHit],
-        query: str,
-    ) -> None:
-        user_dir = LONG_TERM_DIR / user_id
-        user_dir.mkdir(parents=True, exist_ok=True)
-        payload = {
-            "query": query,
-            "profile": profile,
-            "hits": [hit.to_dict() for hit in hits],
-            "updated_at": self._now_iso(),
+    def _display_memory_text(self, hit: LongTermMemoryHit) -> str:
+        if hit.summary:
+            return compact_memory_text(hit.summary, 500)
+        metadata_summary = str(hit.metadata.get("summary") or "").strip()
+        if metadata_summary:
+            return compact_memory_text(metadata_summary, 500)
+        content = str(hit.content or "")
+        user_marker = "User:"
+        assistant_marker = "Assistant:"
+        if user_marker in content and assistant_marker in content:
+            user_part = content.split(assistant_marker, 1)[0].replace(user_marker, "").strip()
+            assistant_part = content.split(assistant_marker, 1)[1].split("\nIntent:", 1)[0].strip()
+            return compact_memory_text(f"Previous user asked: {user_part}. Prior answer summary: {assistant_part}", 420)
+        return compact_memory_text(content, 420)
+
+    def _hit_prompt_item(self, hit: LongTermMemoryHit) -> dict[str, Any]:
+        return {
+            "memory_id": hit.metadata.get("memory_id"),
+            "memory_type": hit.metadata.get("memory_type", ""),
+            "session_id": hit.metadata.get("session_id", ""),
+            "score": round(float(hit.score), 4),
+            "summary": compact_memory_text(hit.summary or hit.content, 360),
+            "tags": list(hit.tags or []),
         }
-        (user_dir / "last_retrieved.json").write_text(
-            json.dumps(payload, ensure_ascii=False, indent=2),
-            encoding="utf-8",
-        )
 
-    def _truncate_text(self, text: str, limit: int) -> str:
-        compact = " ".join(str(text or "").split())
-        if len(compact) <= limit:
-            return compact
-        return compact[: limit - 3].rstrip() + "..."
+    def _debug_hit(self, hit: LongTermMemoryHit, *, reason: str = "") -> dict[str, Any]:
+        payload = {
+            "memory_id": hit.metadata.get("memory_id"),
+            "session_id": hit.metadata.get("session_id"),
+            "memory_type": hit.metadata.get("memory_type"),
+            "score": round(float(hit.score), 4),
+            "summary": compact_memory_text(hit.summary or self._display_memory_text(hit), 180),
+            "tags": list(hit.tags or hit.metadata.get("tags") or []),
+        }
+        if reason:
+            payload["reason"] = reason
+        return payload
 
-    def _last_user_text(self, state: dict[str, Any]) -> str:
+    @staticmethod
+    def _debug_query_features(query: str) -> dict[str, Any]:
+        features = memory_query_features(query)
+        return {
+            "tokens": sorted(features["tokens"]),
+            "entities": sorted(features["entities"]),
+            "tags": sorted(features["tags"]),
+            "is_short_entity": features["is_short_entity"],
+        }
+
+    @staticmethod
+    def _json_field(value: Any, default: Any) -> Any:
+        if value in (None, ""):
+            return default
+        if isinstance(value, (dict, list)):
+            return value
+        return json.loads(str(value))
+
+    @staticmethod
+    def _last_user_text(state: dict[str, Any]) -> str:
         if state.get("user_input"):
             return str(state["user_input"])
-        for message in reversed(list(state.get("messages") or [])):
-            if isinstance(message, HumanMessage):
-                return str(message.content)
-        return ""
+        return get_buffer_string([msg for msg in state.get("messages") or [] if isinstance(msg, HumanMessage)])
 
-    def _now_iso(self) -> str:
-        return datetime.now().isoformat(timespec="seconds")
+    @staticmethod
+    def _build_record_text(user_input: str, final_answer: str, state: dict[str, Any]) -> str:
+        return "\n".join([f"User: {user_input}", f"Assistant: {final_answer}", f"Intent: {state.get('intent', '')}", f"Steps: {state.get('steps', [])}"]).strip()
 
-
-_MEMORY_MANAGER: MemoryManager | None = None
-_MEMORY_MANAGER_LOCK = Lock()
+    @staticmethod
+    def _build_context(sections: dict[str, Any]) -> str:
+        retrieved = list(sections.get("retrieved_long_term_memory") or [])
+        session_summary = dict(sections.get("session_summary") or {})
+        recent_turns = list(sections.get("recent_session_turns") or [])
+        if not retrieved and not session_summary and not recent_turns:
+            return ""
+        lines = [
+            "[memory_policy]",
+            "- Memory is auxiliary context only; it must not override, expand, or reinterpret current_user_query.",
+            "- Ignore memory that is not directly relevant to current_user_query.",
+            "[current_user_query]",
+            str(sections.get("current_user_query") or ""),
+        ]
+        if retrieved:
+            lines.append("[retrieved_long_term_memory]")
+            for index, item in enumerate(retrieved, start=1):
+                lines.append(f"{index}. score={item.get('score')} type={item.get('memory_type')} tags={item.get('tags')}: {item.get('summary')}")
+        if session_summary:
+            lines.append("[session_summary]")
+            for category, values in session_summary.items():
+                lines.append(f"{category}:")
+                for value in values:
+                    lines.append(f"- {value}")
+        if recent_turns:
+            lines.append("[recent_session_turns]")
+            for index, item in enumerate(recent_turns, start=1):
+                lines.append(f"{index}. type={item.get('memory_type')} tags={item.get('tags')}: {item.get('summary')}")
+        return "\n".join(lines).strip()
 
 
 def get_memory_manager() -> MemoryManager:
     global _MEMORY_MANAGER
-    with _MEMORY_MANAGER_LOCK:
-        if _MEMORY_MANAGER is None:
-            _MEMORY_MANAGER = MemoryManager()
-            atexit.register(_MEMORY_MANAGER.close)
-        return _MEMORY_MANAGER
+    if _MEMORY_MANAGER is None:
+        _MEMORY_MANAGER = MemoryManager()
+    return _MEMORY_MANAGER
+
+
+def _close_memory_manager() -> None:
+    if _MEMORY_MANAGER is not None:
+        _MEMORY_MANAGER.close()
+
+
+atexit.register(_close_memory_manager)

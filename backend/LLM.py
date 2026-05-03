@@ -36,13 +36,8 @@ class LLMResponse:
         return asdict(self)
 
 
-def _client(timeout: float | None = None, max_retries: int = 2) -> OpenAI:
-    return OpenAI(
-        base_url=C.VLLM_BASE_URL,
-        api_key=C.VLLM_API_KEY,
-        timeout=C.VLLM_TIMEOUT if timeout is None else timeout,
-        max_retries=max_retries,
-    )
+def _client() -> OpenAI:
+    return OpenAI(base_url=C.VLLM_BASE_URL, api_key=C.VLLM_API_KEY, timeout=C.VLLM_TIMEOUT)
 
 
 def _normalize_image(image: str | Path | Any) -> dict[str, Any]:
@@ -176,22 +171,7 @@ def initialize_llm_pool(instance_count: int = DEFAULT_LLM_INSTANCE_COUNT, **_: A
     names = {item.id for item in models.data}
     if C.VLLM_MODEL not in names:
         raise RuntimeError(f"vLLM 服务中未找到模型 {C.VLLM_MODEL!r}，当前可用模型：{sorted(names)}")
-    probe_llm_completion()
     return 1
-
-
-def probe_llm_completion(timeout_s: float | None = None) -> str:
-    completion = _client(timeout=timeout_s or C.VLLM_HEALTHCHECK_TIMEOUT, max_retries=0).chat.completions.create(
-        model=C.VLLM_MODEL,
-        messages=[{"role": "user", "content": "ping"}],
-        stream=False,
-        max_tokens=1,
-        temperature=0,
-        top_p=1.0,
-        extra_body={"top_k": 1, "repetition_penalty": 1.0},
-    )
-    choice = completion.choices[0]
-    return (choice.message.content or "").strip()
 
 
 def get_llm_pool_size() -> int:

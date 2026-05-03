@@ -11,13 +11,11 @@ backend/tools/SC.py
 说明：
 1. 默认执行 scGPT/scGPT-like 细胞类型分类、UMAP 可视化、PDF 汇总报告。
 2. 如果模型目录缺少 args.json / best_model.pt / vocab.json / celltype_mapping.tsv，自动降级为 Scanpy 基础 QC + UMAP 报告，避免前端没有返回。
-3. 可选 gene correlation 通过 user_text 中的参数开启，例如：
-   "做基因相关 gene_list: [OsPIN1, OsPIN2, OsIAA1] gene_corr_thr: 0.3 topk: 10"
+3. 可选 gene correlation、batch correction 和 deep analysis 参数由 Agent function calling 解析后传入。
 4. 批次矫正入口保留 need_batch_correction 参数；本文件默认不做 DAB 微调训练，若需要完整 DAB/DSBN 微调，可再把原 batch_correction.py 的训练循环并入 _run_batch_correction_if_requested。
 """
 
 import argparse
-import asyncio
 import base64
 import json
 import logging
@@ -74,6 +72,8 @@ DEFAULT_BATCH_SIZE = 128
 DEFAULT_STR_BATCH = "str_batch"
 DEFAULT_GENE_CORR_THR = 0.3
 DEFAULT_GENE_CORR_TOPK = 10
+DEFAULT_CONTEXT_LENGTH = DEFAULT_N_HVG
+GENE_ID_PATH = PROJECT_ROOT / "data" / "gene_id.txt"
 
 _COMMON_TOOL_RESULT_KEYS = {
     "tool_name",
@@ -98,9 +98,12 @@ _COMMON_TOOL_RESULT_KEYS = {
 
 @dataclass(slots=True)
 class SCParams:
+    h5ad_path: str = ""
     need_batch_correction: bool = False
     need_gene_corr: bool = False
+    deep_analysis: bool = False
     gene_list: list[str] = field(default_factory=list)
+    context_length: int = DEFAULT_CONTEXT_LENGTH
     n_hvg: int = DEFAULT_N_HVG
     n_bins: int = DEFAULT_N_BINS
     str_batch: str = DEFAULT_STR_BATCH
@@ -125,9 +128,12 @@ class SCParams:
             genes.append(gene_text)
 
         return SCParams(
+            h5ad_path=str(self.h5ad_path or "").strip(),
             need_batch_correction=bool(self.need_batch_correction),
             need_gene_corr=bool(self.need_gene_corr),
+            deep_analysis=bool(self.deep_analysis),
             gene_list=genes,
+            context_length=max(100, int(self.context_length or DEFAULT_CONTEXT_LENGTH)),
             n_hvg=max(100, int(self.n_hvg or DEFAULT_N_HVG)),
             n_bins=max(2, int(self.n_bins or DEFAULT_N_BINS)),
             str_batch=str(self.str_batch or DEFAULT_STR_BATCH).strip() or DEFAULT_STR_BATCH,
@@ -151,6 +157,8 @@ class SingleCellToolInput:
     @property
     def attachments(self) -> list[dict[str, Any]]:
         path = Path(self.h5ad_path).expanduser()
+        if not str(self.h5ad_path or "").strip():
+            return []
         return [
             {
                 "name": path.name,
@@ -256,7 +264,11 @@ def _resolve_path(path_text: str) -> Path:
     path = Path(str(path_text or "")).expanduser()
     if path.is_absolute():
         return path
-    return PROJECT_ROOT / path
+    candidates = [PROJECT_ROOT / path, PROJECT_ROOT.parent / path, Path.cwd() / path]
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate
+    return candidates[0]
 
 
 def _strip_code_fence(payload: str) -> str:
@@ -267,82 +279,68 @@ def _strip_code_fence(payload: str) -> str:
     return text.strip()
 
 
-def _parse_bool_from_text(text: str, positive_tokens: tuple[str, ...], negative_tokens: tuple[str, ...]) -> bool | None:
-    lower = text.lower()
-    if any(token.lower() in lower for token in negative_tokens):
-        return False
-    if any(token.lower() in lower for token in positive_tokens):
-        return True
-    return None
-
-
-def _extract_gene_list_from_text(text: str) -> list[str]:
-    bracket_match = re.search(
-        r"(?:gene_list|基因列表|genes?)\s*[:：]?\s*(\[[^\]]+\])",
-        text,
-        flags=re.IGNORECASE,
-    )
-    if bracket_match:
-        try:
-            parsed = json.loads(bracket_match.group(1).replace("'", '"'))
-            if isinstance(parsed, list):
-                return [str(item).strip() for item in parsed if str(item).strip()]
-        except json.JSONDecodeError:
-            pass
-
-    suffix_match = re.search(
-        r"(?:gene_list|基因列表|genes?)\s*[:：]?\s*([A-Za-z0-9_,\-\s]+)",
-        text,
-        flags=re.IGNORECASE,
-    )
-    if suffix_match:
-        return [chunk.strip() for chunk in re.split(r"[,，\s]+", suffix_match.group(1).strip()) if chunk.strip()]
-    return []
-
-
-def _extract_number(pattern: str, text: str, cast: type[int] | type[float], default: int | float) -> int | float:
-    match = re.search(pattern, text, flags=re.IGNORECASE)
-    if not match:
-        return default
-    try:
-        return cast(match.group(1))
-    except (TypeError, ValueError):
-        return default
-
-
 def resolve_params_from_text(user_text: str, workspace_settings: dict[str, Any] | None = None) -> SCParams:
+    del user_text
     settings = dict(workspace_settings or {})
-    text = str(user_text or "")
-
-    need_batch = _parse_bool_from_text(
-        text,
-        ("batch correction", "batch effect", "批次矫正", "去批次", "批次校正", "消除批次效应"),
-        ("no batch correction", "不要批次矫正", "无需批次矫正", "不做批次矫正", "不去批次"),
-    )
-    need_corr = _parse_bool_from_text(
-        text,
-        ("gene corr", "gene correlation", "基因相关", "相关网络", "共表达"),
-        ("no gene corr", "no gene correlation", "不要基因相关", "不做基因相关"),
-    )
-
-    str_batch_match = re.search(
-        r"(?:str_batch|batch column|批次列)\s*[:：]?\s*([A-Za-z0-9_.-]+)",
-        text,
-        flags=re.IGNORECASE,
-    )
-
     model_dir = str(settings.get("single_cell_model_dir") or DEFAULT_MODEL_DIR)
     return SCParams(
-        need_batch_correction=bool(need_batch),
-        need_gene_corr=bool(need_corr),
-        gene_list=_extract_gene_list_from_text(text),
-        n_hvg=int(settings.get("single_cell_n_hvg") or _extract_number(r"(?:n_hvg|hvg)\s*[:：]?\s*(\d+)", text, int, DEFAULT_N_HVG)),
+        need_batch_correction=False,
+        need_gene_corr=False,
+        gene_list=[],
+        n_hvg=int(settings.get("single_cell_n_hvg") or DEFAULT_N_HVG),
         n_bins=int(settings.get("single_cell_n_bins") or DEFAULT_N_BINS),
-        str_batch=str_batch_match.group(1) if str_batch_match else str(settings.get("single_cell_batch_key") or DEFAULT_STR_BATCH),
+        str_batch=str(settings.get("single_cell_batch_key") or DEFAULT_STR_BATCH),
         batch_size=int(settings.get("single_cell_batch_size") or DEFAULT_BATCH_SIZE),
-        gene_corr_thr=float(_extract_number(r"(?:gene_corr_thr|corr_threshold|相关阈值)\s*[:：]?\s*([0-9]*\.?[0-9]+)", text, float, DEFAULT_GENE_CORR_THR)),
-        gene_corr_topk=int(_extract_number(r"(?:gene_corr_topk|corr_topk|topk)\s*[:：]?\s*(\d+)", text, int, DEFAULT_GENE_CORR_TOPK)),
+        gene_corr_thr=DEFAULT_GENE_CORR_THR,
+        gene_corr_topk=DEFAULT_GENE_CORR_TOPK,
         model_dir_cls=model_dir,
+        seed=int(settings.get("single_cell_seed") or 0),
+        amp=bool(settings.get("single_cell_amp", True)),
+    ).normalized()
+
+
+def resolve_params_with_llm(user_text: str, workspace_settings: dict[str, Any] | None = None, h5ad_path: str = "") -> SCParams:
+    from ..prompts import build_sc_params_prompt
+    from .LLM import GenerationConfig, chat
+
+    settings = dict(workspace_settings or {})
+    gene_catalog = GENE_ID_PATH.read_text(encoding="utf-8", errors="ignore") if GENE_ID_PATH.exists() else ""
+    prompt = build_sc_params_prompt(
+        user_text=user_text,
+        h5ad_path=h5ad_path,
+        workspace_settings=settings,
+        gene_catalog=gene_catalog,
+        default_context_length=DEFAULT_CONTEXT_LENGTH,
+        default_n_hvg=DEFAULT_N_HVG,
+        default_gene_corr_thr=DEFAULT_GENE_CORR_THR,
+        default_gene_corr_topk=DEFAULT_GENE_CORR_TOPK,
+    )
+    output = chat(prompt=prompt, gen_config=GenerationConfig(max_new_tokens=768, temperature=0, top_p=1.0, do_sample=False))
+    raw = _strip_code_fence(output)
+    start, end = raw.find("{"), raw.rfind("}")
+    if start >= 0 and end > start:
+        raw = raw[start : end + 1]
+    payload = json.loads(raw)
+    if not isinstance(payload, dict):
+        raise ValueError("configure_sc_analysis arguments must be a JSON object.")
+    context_length = int(payload.get("context_length") or settings.get("single_cell_context_length") or DEFAULT_CONTEXT_LENGTH)
+    n_hvg = int(payload.get("n_hvg") or settings.get("single_cell_n_hvg") or context_length)
+    need_gene_corr = bool(payload.get("need_gene_corr"))
+    gene_list = [str(item) for item in (payload.get("gene_list") or [])] if need_gene_corr else []
+    return SCParams(
+        h5ad_path=str(payload.get("h5ad_path") or h5ad_path or ""),
+        need_batch_correction=bool(payload.get("need_batch_correction")),
+        need_gene_corr=need_gene_corr,
+        deep_analysis=bool(payload.get("deep_analysis")),
+        gene_list=gene_list,
+        context_length=context_length,
+        n_hvg=n_hvg,
+        n_bins=int(settings.get("single_cell_n_bins") or DEFAULT_N_BINS),
+        str_batch=str(payload.get("str_batch") or settings.get("single_cell_batch_key") or "sample"),
+        batch_size=int(settings.get("single_cell_batch_size") or DEFAULT_BATCH_SIZE),
+        gene_corr_thr=float(payload.get("gene_corr_thr") or DEFAULT_GENE_CORR_THR),
+        gene_corr_topk=int(payload.get("gene_corr_topk") or DEFAULT_GENE_CORR_TOPK),
+        model_dir_cls=str(settings.get("single_cell_model_dir") or DEFAULT_MODEL_DIR),
         seed=int(settings.get("single_cell_seed") or 0),
         amp=bool(settings.get("single_cell_amp", True)),
     ).normalized()
@@ -798,6 +796,25 @@ def save_gene_corr_network_png(
     plt.close()
 
 
+def expand_gene_corr_candidates(adata: sc.AnnData, target_genes: list[str], limit: int) -> list[str]:
+    if "gene_name" in adata.var.columns:
+        available = [str(item) for item in adata.var["gene_name"].tolist()]
+    else:
+        available = [str(item) for item in adata.var_names.tolist()]
+    available_upper = {item.upper() for item in available}
+    seen = {str(gene).upper() for gene in target_genes}
+    genes = [str(gene) for gene in target_genes if str(gene).upper() in available_upper]
+    for gene in available:
+        key = gene.upper()
+        if key in seen:
+            continue
+        genes.append(gene)
+        seen.add(key)
+        if len(genes) >= limit:
+            break
+    return genes
+
+
 # -----------------------------------------------------------------------------
 # PDF report
 # -----------------------------------------------------------------------------
@@ -851,13 +868,16 @@ def build_pdf_report(
         f"mode: {result_payload.get('mode')}",
         f"model_dir: {params.model_dir_cls}",
         f"n_hvg: {params.n_hvg}",
+        f"context_length: {params.context_length}",
         f"n_bins: {params.n_bins}",
         f"runtime_device: {runtime.get('device', 'unknown')}",
         f"cuda_available: {runtime.get('torch_cuda_available')}",
         f"visible_gpu_count: {runtime.get('visible_gpu_count')}",
         f"need_batch_correction: {params.need_batch_correction}",
         f"used_batch_correction: {result_payload.get('used_batch_correction')}",
+        f"batch_correction_method: {result_payload.get('batch_correction_method') or '(none)'}",
         f"need_gene_corr: {params.need_gene_corr}",
+        f"deep_analysis: {params.deep_analysis}",
         f"gene_list: {', '.join(params.gene_list) if params.gene_list else '(none)'}",
         f"result_h5ad: {result_payload.get('result_h5ad') or '(missing)'}",
     ]
@@ -869,6 +889,7 @@ def build_pdf_report(
         _add_summary_page(pdf, "Single-Cell Analysis Report", summary_lines)
         image_items = [
             ("qc_png", "Quality Control Summary"),
+            ("umap_batch_before_png", "UMAP by Batch Before Correction"),
             ("umap_celltype_png", "UMAP by Predicted Cell Type"),
             ("umap_batch_png", "UMAP by Batch"),
             ("gene_corr_png", "Gene Correlation Network"),
@@ -893,7 +914,9 @@ def build_report_context_text(*, user_text: str, input_h5ad: Path, params: SCPar
         f"Runtime device: {runtime.get('device', 'unknown')}",
         f"Batch correction requested: {params.need_batch_correction}",
         f"Batch correction used: {result_payload.get('used_batch_correction')}",
+        f"Batch correction method: {result_payload.get('batch_correction_method') or '(none)'}",
         f"Gene correlation requested: {params.need_gene_corr}",
+        f"Deep analysis requested: {params.deep_analysis}",
         f"Result h5ad: {result_payload.get('result_h5ad')}",
     ]
     return "\n".join(lines)
@@ -977,16 +1000,30 @@ def analyze_h5ad_to_pdf(
         warnings_list.append(f"Model classification skipped; fallback to Scanpy workflow. Reason: {exc}")
         original = run_scanpy_fallback(original, n_hvg=params.n_hvg, seed=params.seed)
 
-    # 批次矫正：这里保留结果字段。完整 DAB 微调训练不在本文件默认启用。
+    umap_batch_before_png: Path | None = None
     used_batch_correction = False
+    batch_correction_method = ""
     if params.need_batch_correction:
         if not has_batch:
             warnings_list.append(f"Batch correction requested but no multi-batch column found for '{params.str_batch}'.")
         else:
-            warnings_list.append(
-                "Batch correction requested, but DAB/DSBN finetuning is not enabled in this compact SC.py. "
-                "Current report uses classification/fallback embedding."
-            )
+            sc.pp.neighbors(original, use_rep="X_cell_emb")
+            sc.tl.umap(original, random_state=params.seed)
+            umap_batch_before_png = outdir / "umap_batch_before_correction.png"
+            save_umap_png(original, umap_batch_before_png, color=params.str_batch, title=f"UMAP before batch correction ({params.str_batch})")
+
+            emb = np.asarray(original.obsm["X_cell_emb"], dtype=np.float32)
+            corrected = emb.copy()
+            global_mean = emb.mean(axis=0, keepdims=True)
+            batch_values = original.obs[params.str_batch].astype(str).to_numpy()
+            for batch_value in sorted(set(batch_values.tolist())):
+                mask = batch_values == batch_value
+                if int(mask.sum()) > 0:
+                    corrected[mask] = emb[mask] - emb[mask].mean(axis=0, keepdims=True) + global_mean
+            original.obsm["X_cell_emb_bc"] = corrected.astype(np.float32)
+            original.obsm["X_cell_emb"] = original.obsm["X_cell_emb_bc"]
+            used_batch_correction = True
+            batch_correction_method = "batch_mean_centering_on_cell_embedding"
 
     sc.pp.neighbors(original, use_rep="X_cell_emb")
     sc.tl.umap(original, random_state=params.seed)
@@ -1001,11 +1038,18 @@ def analyze_h5ad_to_pdf(
 
     gene_corr_png: Path | None = None
     genes_used: list[str] = []
+    target_genes_for_corr: list[str] = []
     if params.need_gene_corr:
         try:
+            target_genes_for_corr = list(params.gene_list)
+            corr_candidates = expand_gene_corr_candidates(
+                original,
+                target_genes_for_corr,
+                limit=max(len(target_genes_for_corr) + 10, min(80, len(target_genes_for_corr) + params.gene_corr_topk * 6)),
+            )
             genes_used, corr = compute_gene_corr(
                 adata=original,
-                gene_list=params.gene_list,
+                gene_list=corr_candidates,
                 model_dir_cls=params.model_dir_cls,
                 method="spearman",
             )
@@ -1027,10 +1071,14 @@ def analyze_h5ad_to_pdf(
         "used_model": used_model,
         "need_batch_correction": params.need_batch_correction,
         "used_batch_correction": used_batch_correction,
+        "batch_correction_method": batch_correction_method,
         "has_batch": has_batch,
         "batch_key": params.str_batch,
         "need_gene_corr": params.need_gene_corr,
+        "deep_analysis": params.deep_analysis,
+        "target_genes_for_corr": target_genes_for_corr,
         "genes_used_for_corr": genes_used,
+        "context_length": params.context_length,
         "n_hvg": params.n_hvg,
         "gene_corr_thr": params.gene_corr_thr,
         "gene_corr_topk": params.gene_corr_topk,
@@ -1042,16 +1090,21 @@ def analyze_h5ad_to_pdf(
         "mode": mode,
         "used_model": used_model,
         "used_batch_correction": used_batch_correction,
+        "batch_correction_method": batch_correction_method,
         "has_batch": has_batch,
         "batch_key": params.str_batch,
         "need_gene_corr": params.need_gene_corr,
+        "deep_analysis": params.deep_analysis,
+        "target_genes_for_corr": target_genes_for_corr,
         "genes_used_for_corr": genes_used,
+        "context_length": int(params.context_length),
         "n_cells": int(original.n_obs),
         "n_genes": int(original.n_vars),
         "n_hvg": int(params.n_hvg),
         "runtime": runtime,
         "warnings": warnings_list,
         "qc_png": str(qc_png) if qc_png.exists() else None,
+        "umap_batch_before_png": str(umap_batch_before_png) if umap_batch_before_png else None,
         "umap_celltype_png": str(umap_celltype_png),
         "umap_batch_png": str(umap_batch_png) if umap_batch_png else None,
         "gene_corr_png": str(gene_corr_png) if gene_corr_png else None,
@@ -1085,24 +1138,39 @@ def analyze_h5ad_to_pdf(
 # -----------------------------------------------------------------------------
 
 
-async def run_sc_analysis_query(agent_input: Any) -> dict[str, Any]:
+def run_sc_analysis_query(agent_input: Any) -> dict[str, Any]:
     started_at = time.perf_counter()
     user_id = str(_get_attr(agent_input, "user_id", "anonymous") or "anonymous")
     session_id = str(_get_attr(agent_input, "session_id", "manual") or "manual")
     user_text = str(_get_attr(agent_input, "user_text", "") or "")
     workspace_settings = dict(_get_attr(agent_input, "workspace_settings", {}) or {})
 
+    supplied_h5ad = str(_get_attr(agent_input, "h5ad_path", "") or "")
+    try:
+        params = resolve_params_with_llm(user_text, workspace_settings, supplied_h5ad).normalized()
+    except Exception as exc:
+        return _build_tool_result(
+            status="error",
+            query=user_text,
+            message=f"Single-cell parameter function call failed: {exc}",
+            evidence_status="not_applicable",
+            metrics={"tool_ms": round((time.perf_counter() - started_at) * 1000, 2)},
+            meta={"function_call_name": "configure_sc_analysis", "function_call_llm_count": 1},
+        )
+
     asset = _find_h5ad_asset(agent_input)
-    if asset is None:
+    h5ad_text = str(_get_attr(asset, "path", "") or params.h5ad_path or supplied_h5ad) if asset is not None else str(params.h5ad_path or supplied_h5ad)
+    if not h5ad_text:
         return _build_tool_result(
             status="error",
             query=user_text,
             message="Single-cell analysis requires an h5ad attachment.",
             evidence_status="not_applicable",
             metrics={"tool_ms": round((time.perf_counter() - started_at) * 1000, 2)},
+            meta={"function_call_name": "configure_sc_analysis", "function_call_arguments": asdict(params), "function_call_llm_count": 1},
         )
 
-    h5ad_path = _resolve_path(str(_get_attr(asset, "path", "") or ""))
+    h5ad_path = _resolve_path(h5ad_text)
     if not h5ad_path.exists() or not h5ad_path.is_file():
         return _build_tool_result(
             status="error",
@@ -1110,16 +1178,14 @@ async def run_sc_analysis_query(agent_input: Any) -> dict[str, Any]:
             message=f"h5ad file not found: {h5ad_path}",
             evidence_status="not_applicable",
             metrics={"tool_ms": round((time.perf_counter() - started_at) * 1000, 2)},
-            meta={"input_h5ad": str(h5ad_path)},
+            meta={"input_h5ad": str(h5ad_path), "function_call_name": "configure_sc_analysis", "function_call_arguments": asdict(params), "function_call_llm_count": 1},
         )
 
-    params = resolve_params_from_text(user_text, workspace_settings).normalized()
     run_root = _session_root(user_id, session_id) / "artifacts" / "single_cell_analysis"
     run_root.mkdir(parents=True, exist_ok=True)
 
     try:
-        raw_result = await asyncio.to_thread(
-            analyze_h5ad_to_pdf,
+        raw_result = analyze_h5ad_to_pdf(
             h5ad_path=h5ad_path,
             output_dir=run_root,
             user_text=user_text,
@@ -1133,7 +1199,7 @@ async def run_sc_analysis_query(agent_input: Any) -> dict[str, Any]:
             message=f"Single-cell analysis failed: {exc}",
             evidence_status="not_applicable",
             metrics={"tool_ms": round((time.perf_counter() - started_at) * 1000, 2)},
-            meta={"input_h5ad": str(h5ad_path)},
+            meta={"input_h5ad": str(h5ad_path), "function_call_name": "configure_sc_analysis", "function_call_arguments": asdict(params), "function_call_llm_count": 1},
         )
 
     pdf_path = Path(raw_result["pdf_report"])
@@ -1142,6 +1208,19 @@ async def run_sc_analysis_query(agent_input: Any) -> dict[str, Any]:
     pdf_url = f"/api/users/{_safe_id(user_id, 'anonymous')}/sessions/{_safe_id(session_id, 'manual')}/artifacts/{relative_pdf.as_posix()}"
 
     answer = "Single-cell analysis completed.\n" f"PDF report: {pdf_path.name}\n" f"Mode: {raw_result.get('mode')}\n" f"Cells: {raw_result.get('n_cells')}, Genes: {raw_result.get('n_genes')}"
+    if params.need_batch_correction:
+        answer += (
+            "\nBatch correction: "
+            + ("used" if raw_result.get("used_batch_correction") else "not used")
+            + f"; method={raw_result.get('batch_correction_method') or 'none'}; "
+            + f"before_plot={raw_result.get('umap_batch_before_png') or 'none'}; after_plot={raw_result.get('umap_batch_png') or 'none'}"
+        )
+    if params.need_gene_corr:
+        answer += "\nGene correlation: " + (
+            f"target_genes={', '.join(raw_result.get('target_genes_for_corr') or params.gene_list)}; "
+            f"candidate_gene_count={len(raw_result.get('genes_used_for_corr') or [])}; "
+            f"plot={raw_result.get('gene_corr_png') or 'none'}"
+        )
     if raw_result.get("warnings"):
         answer += "\nWarnings:\n" + "\n".join(f"- {item}" for item in raw_result.get("warnings", []))
 
@@ -1162,7 +1241,18 @@ async def run_sc_analysis_query(agent_input: Any) -> dict[str, Any]:
         evidence_status="sufficient",
         artifacts=artifacts,
         metrics={"tool_ms": round((time.perf_counter() - started_at) * 1000, 2), "analysis_ms": raw_result.get("elapsed_ms")},
-        meta={"input_h5ad": str(h5ad_path), "runner": "backend.tools.SC.run_sc_analysis_query"},
+        meta={
+            "input_h5ad": str(h5ad_path),
+            "runner": "backend.tools.SC.run_sc_analysis_query",
+            "function_call_name": "configure_sc_analysis",
+            "function_call_arguments": asdict(params),
+            "function_call_llm_count": 1,
+            "deep_analysis": params.deep_analysis,
+            "need_batch_correction": params.need_batch_correction,
+            "need_gene_corr": params.need_gene_corr,
+            "gene_list": params.gene_list,
+            "pdf_report": str(pdf_path),
+        },
         observation=_extract_tool_observation(raw_result),
         analysis_params=asdict(params),
         analysis_result=raw_result,

@@ -32,19 +32,22 @@ redis-server
 
 从 `.env.example` 复制为 `.env` 后按需填写。当前真实运行至少要关注这几组变量：
 
-- 本地模型：
+- 本地 LLM / vLLM：
   - `LLM_MODEL_PATH`
+  - `LLM_MODEL_NAME`
+  - `VLLM_BASE_URL`（默认 `http://127.0.0.1:8080/v1`）
+  - `AGENT_DISABLE_VLLM_START`（默认 `0`，设置为 `1` 时不由后端自动拉起 vLLM）
+  - `VLLM_HOST` / `VLLM_PORT`
+  - `VLLM_TENSOR_PARALLEL_SIZE`
+  - `VLLM_GPU_MEMORY_UTILIZATION`
+  - `VLLM_MAX_MODEL_LEN`
+  - `VLLM_EXTRA_ARGS`
   - `EMBEDDING_MODEL_PATH`
 - Web Search：
   - `SERPER_API_KEY`
 - 记忆系统：
   - `REDIS_URL`
   - `AGENT_MEMORY_TTL_MINUTES`
-  - `AGENT_MEMORY_MYSQL_DB`
-  - `AGENT_MEMORY_MYSQL_USER`
-  - `AGENT_MEMORY_MYSQL_PASSWORD`
-  - `AGENT_MEMORY_MYSQL_HOST`
-  - `AGENT_MEMORY_MYSQL_PORT`
   - `AGENT_MEMORY_VECTOR_COLLECTION`
   - `AGENT_MEMORY_VECTOR_SCORE_THRESHOLD`
 - 行为控制：
@@ -64,10 +67,45 @@ redis-server
 ## 4. 启动服务
 
 ```bash
-uvicorn backend.main:app --host 0.0.0.0 --port 8000 --reload
+./start.sh
+```
+
+开发时如需热重载：
+
+```bash
+./start.sh --host 0.0.0.0 --port 8000 --reload
+```
+
+默认只会在退出时关闭本次 `./start.sh` 自己启动的 MySQL/Redis；如果需要连启动前已经存在的服务也一起关闭：
+
+```bash
+AGENT_STOP_EXISTING_SERVICES_ON_EXIT=1 ./start.sh
+```
+
+后端自动拉起的 vLLM 会在 uvicorn 退出时关闭并释放显存。若需要连启动前已经存在、监听同一 `VLLM_PORT` 的 vLLM 也一起关闭：
+
+```bash
+AGENT_STOP_EXISTING_VLLM_ON_EXIT=1 ./start.sh
 ```
 
 浏览器访问：`http://127.0.0.1:8000/`
+
+后端启动时只访问 vLLM 根地址的 `/health` 判断服务是否就绪，不在启动阶段发生成请求；推理接口统一使用 `VLLM_BASE_URL` 规范化后的 `/v1/chat/completions`。如果本地 vLLM 已经运行，则直接复用；如果未运行，后端会用 `LLM_MODEL_PATH` 自动启动 OpenAI 兼容接口，默认监听 `127.0.0.1:8080`，并设置 `--max-model-len 8192`。vLLM 日志默认写入 `data/vllm_log.txt`，默认最多等待 300 秒。只有设置 `AGENT_DISABLE_VLLM_START=1` 时，后端才不会自动拉起 vLLM。
+
+也可以手动先启动 vLLM，再让 Agent 只通过本地地址调用：
+
+```bash
+vllm serve ./models/Qwen2.5-VL-7B-Instruct \
+  --served-model-name Qwen2.5-VL-7B-Instruct \
+  --host 127.0.0.1 \
+  --port 8080 \
+  --trust-remote-code \
+  --max-model-len 8192
+
+export AGENT_DISABLE_VLLM_START=1
+export VLLM_BASE_URL=http://127.0.0.1:8080/v1
+export LLM_MODEL_NAME=Qwen2.5-VL-7B-Instruct
+```
 
 ## 5. 重建本地知识库索引
 

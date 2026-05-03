@@ -9,6 +9,7 @@ import {
   formatReferenceLabel,
   formatRouteIntent,
   formatTimestamp,
+  formatToolLabel,
   parseJsonResponse,
 } from './utils/agent'
 
@@ -18,7 +19,7 @@ const STORAGE_KEYS = {
 }
 
 const DEFAULT_LOCAL_SOURCE_MIN_SCORE = 0.35
-const DEFAULT_WEB_SOURCE_MIN_SCORE = 1.5
+const DEFAULT_WEB_SOURCE_MIN_SCORE = 0.35
 const FILE_KIND_LABELS = {
   image: '图片',
   pdf: 'PDF',
@@ -83,6 +84,7 @@ function createDefaultWorkspaceSettings() {
     short_term_max_messages: 12,
     short_term_summary_threshold: 8,
     long_term_top_k: 3,
+    multi_query_count: 3,
     local_source_min_score: DEFAULT_LOCAL_SOURCE_MIN_SCORE,
     web_source_min_score: DEFAULT_WEB_SOURCE_MIN_SCORE,
     enable_profile_memory: true,
@@ -106,6 +108,12 @@ function createEmptySourceData() {
     references: [],
     chunks: [],
     trace: null,
+    runSummaryRows: [],
+    artifacts: [],
+    scAnalysisMeta: null,
+    analysisParams: null,
+    analysisResult: null,
+    pdfInterpretation: '',
     raw: '',
   }
 }
@@ -238,6 +246,97 @@ function prettyJson(value) {
   return JSON.stringify(value, null, 2)
 }
 
+function compactForDrawer(value, depth = 0) {
+  if (value == null || typeof value !== 'object') {
+    if (typeof value === 'string' && value.length > 4000) {
+      return `${value.slice(0, 4000)}\n...已截断，完整内容请查看生成文件。`
+    }
+    return value
+  }
+  if (depth >= 3) {
+    return Array.isArray(value) ? `Array(${value.length})` : 'Object'
+  }
+  if (Array.isArray(value)) {
+    const items = value.slice(0, 20).map((item) => compactForDrawer(item, depth + 1))
+    if (value.length > items.length) {
+      items.push(`...其余 ${value.length - items.length} 项已省略`)
+    }
+    return items
+  }
+  return Object.fromEntries(
+    Object.entries(value).map(([key, item]) => [key, compactForDrawer(item, depth + 1)]),
+  )
+}
+
+function pickRagTrace(structured) {
+  return (
+    structured?.retrieval_trace
+    || structured?.meta?.rag_retrieval_trace
+    || structured?.meta?.retrieval_trace
+    || null
+  )
+}
+
+function pickScAnalysisMeta(structured) {
+  return structured?.meta?.sc_analysis_meta || structured?.sc_analysis_meta || null
+}
+
+function pickWebMeta(structured) {
+  return structured?.meta?.web_search_meta || structured?.web_search?.meta || null
+}
+
+function pickLlmCallCount(structured, agentPayload) {
+  const value = Number(
+    structured?.metrics?.llm_call_count
+      ?? structured?.meta?.llm_call_count
+      ?? agentPayload?.decision?.llm_call_count
+      ?? agentPayload?.state?.llm_call_count,
+  )
+  return Number.isFinite(value) ? value : null
+}
+
+function formatSummaryNumber(value, digits = 4) {
+  const numberValue = Number(value)
+  if (!Number.isFinite(numberValue)) {
+    return ''
+  }
+  return numberValue.toFixed(digits)
+}
+
+function appendRunSummaryRow(rows, label, value) {
+  const normalized = value == null ? '' : String(value).trim()
+  if (normalized) {
+    rows.push({ label, value: normalized })
+  }
+}
+
+function buildRunSummaryRows(structured, agentPayload, trace, pdfReport, webResults) {
+  const rows = []
+  const meta = structured?.meta || {}
+  const metrics = structured?.metrics || {}
+  const scMeta = pickScAnalysisMeta(structured) || {}
+  const webMeta = pickWebMeta(structured) || {}
+
+  appendRunSummaryRow(rows, '信息来源', meta.final_information_source)
+  appendRunSummaryRow(rows, 'LLM 调用次数', pickLlmCallCount(structured, agentPayload))
+  appendRunSummaryRow(rows, '工具', formatToolLabel(structured?.tool_name || ''))
+  appendRunSummaryRow(rows, 'RAG 置信度', formatSummaryNumber(meta.confidence ?? trace?.confidence))
+  appendRunSummaryRow(rows, 'Reranker top score', formatSummaryNumber(metrics.reranker_top_score ?? trace?.reranker_top_score))
+  appendRunSummaryRow(rows, 'Multi-query 配置数', trace?.multi_query_count_configured)
+  appendRunSummaryRow(rows, 'Multi-query 使用数', trace?.multi_query_count_used)
+  appendRunSummaryRow(rows, 'BM25 候选数', trace?.bm25_candidate_count ?? metrics.bm25_candidate_count)
+  appendRunSummaryRow(rows, '向量候选数', trace?.vector_candidate_count ?? metrics.vector_candidate_count)
+  appendRunSummaryRow(rows, 'RRF 融合数', trace?.rrf_fused_count ?? metrics.rrf_fused_count)
+  appendRunSummaryRow(rows, '最终 chunk 数', trace?.final_chunk_count ?? metrics.hit_count)
+  appendRunSummaryRow(rows, 'Web 结果数', webMeta.retained_results_count ?? structured?.web_search?.retained_results_count ?? webResults.length)
+  appendRunSummaryRow(rows, '输入 h5ad', scMeta.input_h5ad)
+  appendRunSummaryRow(rows, '去批次', scMeta.need_batch_correction == null ? '' : scMeta.need_batch_correction ? '是' : '否')
+  appendRunSummaryRow(rows, '基因相关性', scMeta.need_gene_corr == null ? '' : scMeta.need_gene_corr ? '是' : '否')
+  appendRunSummaryRow(rows, '目标基因', Array.isArray(scMeta.gene_list) ? scMeta.gene_list.join(', ') : '')
+  appendRunSummaryRow(rows, 'PDF 报告', pdfReport?.path || pdfReport?.url)
+  return rows
+}
+
 function getStoredUserId() {
   return window.localStorage.getItem(STORAGE_KEYS.userId) || ''
 }
@@ -319,9 +418,24 @@ function hasRouteTrace(message) {
   return Boolean(message?.routeStreamEvents?.length || routeModel(message))
 }
 
+function hasRouteIntentStats(message) {
+  const model = routeModel(message)
+  return Boolean(model?.intentLabel || (model?.llmCallCount !== null && model?.llmCallCount !== undefined))
+}
+
 function messageHasLocalSources(message) {
   const data = message?.sourceData || {}
-  return Boolean(data.references?.length || data.chunks?.length || data.trace || data.raw)
+  return Boolean(
+    data.references?.length
+      || data.chunks?.length
+      || data.trace
+      || data.runSummaryRows?.length
+      || data.scAnalysisMeta
+      || data.analysisParams
+      || data.analysisResult
+      || data.pdfInterpretation
+      || data.raw,
+  )
 }
 
 function messageHasWebSources(message) {
@@ -332,7 +446,7 @@ function messageHasWebSources(message) {
 function localSourceButtonLabel(message) {
   const data = message?.sourceData || {}
   const count = Number(data.references?.length || 0) + Number(data.chunks?.length || 0)
-  return count ? `本地来源 ${count}` : '本地来源'
+  return count ? `本地来源 ${count}` : '运行详情'
 }
 
 function webSourceButtonLabel(message) {
@@ -355,6 +469,31 @@ function filterWebResultsByScore(results, thresholdOverride = null) {
     ? Number(thresholdOverride)
     : currentWebThreshold()
   return (results || []).filter((item) => Number(item?.score || 0) >= threshold)
+}
+
+function normalizeWebResults(results, references = []) {
+  const refByUrl = new Map(
+    (references || [])
+      .map((item) => [String(item?.url || item?.link || '').trim(), item])
+      .filter(([url]) => url),
+  )
+  const sourceRows = (results || []).length ? results : references
+  const total = Math.max(sourceRows.length, references.length, 1)
+  return (sourceRows || []).map((item, index) => {
+    const url = String(item?.url || item?.link || '').trim()
+    const ref = refByUrl.get(url) || references[index] || {}
+    const score = Number(item?.score ?? ref?.score ?? Math.max(1, total - index))
+    return {
+      ...ref,
+      ...item,
+      url,
+      link: url,
+      title: item?.title || ref?.title || 'Untitled',
+      snippet: item?.snippet || ref?.snippet || '',
+      score: Number.isFinite(score) ? score : 0,
+      source_tier: item?.source_tier || item?.result_type || ref?.source_tier || ref?.source || 'web',
+    }
+  })
 }
 
 function filterReferencesByScore(references) {
@@ -422,15 +561,27 @@ function appendRouteDecision(message, data) {
   const node = String(data.next_node || data.action || data.decision || '')
   const thought = String(data.thought || data.reason || '').trim()
   const query = String(data.action_input?.query || '').trim()
+  message.routeStreamEvents = Array.isArray(message.routeStreamEvents) ? message.routeStreamEvents : []
   const detail = [
     thought ? `决策=${thought}` : '',
     node ? `选择节点=${formatRouteIntent(node) || node}` : '',
-    data.intent ? `意图=${formatRouteIntent(String(data.intent || ''))}` : '',
+    (data.intent_type || data.intent)
+      ? `意图=${formatRouteIntent(String(data.intent_type || data.intent || ''))}`
+      : '',
     query ? `检索问题=${query}` : '',
   ]
     .filter(Boolean)
     .join(' | ')
-  upsertRouteStreamEvent(message, 'router-decision', '路由决策', detail)
+  const decisionIndex =
+    message.routeStreamEvents.filter((item) =>
+      String(item.key || '').startsWith('router-decision-'),
+    ).length + 1
+  message.routeStreamEvents.push({
+    key: `router-decision-${decisionIndex}`,
+    title: decisionIndex > 1 ? `路由决策 ${decisionIndex}` : '路由决策',
+    detail,
+  })
+  scrollChatToBottom()
 }
 
 function appendThoughtEvent(message, data) {
@@ -451,7 +602,9 @@ function appendThoughtEvent(message, data) {
   const detail = [
     thought ? `决策=${thought}` : '',
     node ? `选择节点=${formatRouteIntent(node) || node}` : '',
-    data.intent ? `意图=${formatRouteIntent(String(data.intent || ''))}` : '',
+    (data.intent_type || data.intent)
+      ? `意图=${formatRouteIntent(String(data.intent_type || data.intent || ''))}`
+      : '',
     data.plan ? `计划=${String(data.plan || '')}` : '',
     data.tool_name ? `工具=${String(data.tool_name || '')}` : '',
   ]
@@ -479,19 +632,23 @@ function renderStructuredPayload(message, payload) {
 
   if (agentPayload?.decision) {
     message.routeTrace = {
-      intent: agentPayload.decision.intent || '',
+      intent: agentPayload.decision.intent_type || agentPayload.decision.intent || '',
+      intent_type: agentPayload.decision.intent_type || '',
       reason: agentPayload.decision.reason || '',
       dispatched_node: agentPayload?.graph_execution?.dispatched_node || '',
       selected_tools: agentPayload.decision.selected_tools || [],
       execution_steps: agentPayload.decision.execution_steps || [],
       llm_traces: agentPayload.decision.llm_traces || [],
+      llm_call_count: pickLlmCallCount(structured, agentPayload),
     }
   }
 
   if (structured?.answer) {
     const localAnswer = structured.local_answer || structured.answer
-    const references = filterReferencesByScore(structured.references || [])
-    const localChunks = filterLocalChunksByScore(structured.retrieved_chunks || [])
+    const toolName = String(structured.tool_name || '')
+    const isWebPrimary = toolName === 'web_search'
+    const references = isWebPrimary ? [] : filterReferencesByScore(structured.references || [])
+    const localChunks = filterLocalChunksByScore(structured.chunks || structured.retrieved_chunks || [])
     const effectiveWebThreshold = Number(
       structured.web_search?.web_source_effective_min_score
       ?? structured.web_source_effective_min_score
@@ -503,11 +660,18 @@ function renderStructuredPayload(message, payload) {
       ?? structured.web_source_configured_min_score
       ?? currentWebThreshold()
     )
+    const rawWebReferences = isWebPrimary ? structured.references || [] : structured.web_search?.references || []
     const webResults = filterWebResultsByScore(
-      structured.web_search?.results || structured.results || [],
+      normalizeWebResults(
+        structured.web_search?.results || structured.results || [],
+        rawWebReferences,
+      ),
       effectiveWebThreshold,
     )
     const pdfReport = structured.pdf_report || (structured.artifacts || []).find((item) => item.kind === 'pdf')
+    const trace = pickRagTrace(structured)
+    const scAnalysisMeta = pickScAnalysisMeta(structured)
+    const runSummaryRows = buildRunSummaryRows(structured, agentPayload, trace, pdfReport, webResults)
 
     message.content = localAnswer
     message.sourceData = {
@@ -530,17 +694,26 @@ function renderStructuredPayload(message, payload) {
       ),
       webRawResultsCount: Number(
         structured.web_search?.raw_results_count
+        ?? structured.meta?.web_search_meta?.raw_results_count
         ?? structured.raw_results_count
+        ?? rawWebReferences.length
         ?? 0
       ),
       webRetainedResultsCount: Number(
         structured.web_search?.retained_results_count
+        ?? structured.meta?.web_search_meta?.retained_results_count
         ?? structured.retained_results_count
         ?? webResults.length
       ),
       references,
       chunks: localChunks,
-      trace: structured.retrieval_trace || null,
+      trace,
+      runSummaryRows,
+      artifacts: structured.artifacts || [],
+      scAnalysisMeta: scAnalysisMeta ? compactForDrawer(scAnalysisMeta) : null,
+      analysisParams: structured.analysis_params ? compactForDrawer(structured.analysis_params) : null,
+      analysisResult: structured.analysis_result ? compactForDrawer(structured.analysis_result) : null,
+      pdfInterpretation: String(structured.pdf_interpretation || ''),
       raw: '',
     }
     message.artifact = pdfReport?.url ? pdfReport : null
@@ -1371,11 +1544,22 @@ onBeforeUnmount(() => {
                           class="trace-card"
                         >
                           <p>{{ trace.decision }}</p>
-                          <small v-if="trace.selectedNode || trace.elapsedMs">
-                            {{ trace.selectedNode || trace.label || '路由' }}
+                          <small v-if="trace.selectedNode || trace.intentLabel || trace.elapsedMs">
+                            {{ trace.selectedNode || trace.intentLabel || trace.label || '路由' }}
+                            <span v-if="trace.selectedNode && trace.intentLabel">· {{ trace.intentLabel }}</span>
                             <span v-if="trace.elapsedMs"> · {{ Number(trace.elapsedMs).toFixed(0) }} ms</span>
                           </small>
                         </article>
+                      </section>
+
+                      <section v-if="hasRouteIntentStats(message)" class="route-section">
+                        <h4>意图与调用次数</h4>
+                        <p>
+                          <span v-if="routeModel(message)?.intentLabel">意图：{{ routeModel(message).intentLabel }}</span>
+                          <span v-if="routeModel(message)?.llmCallCount !== null && routeModel(message)?.llmCallCount !== undefined">
+                            {{ routeModel(message)?.intentLabel ? ' | ' : '' }}LLM 调用次数：{{ routeModel(message).llmCallCount }}
+                          </span>
+                        </p>
                       </section>
 
                       <section v-if="routeModel(message)?.reason" class="route-section">
@@ -1474,7 +1658,35 @@ onBeforeUnmount(() => {
       <p class="drawer-copy">{{ sourceSummary }}</p>
       <el-tabs v-model="sourceDrawer.tab">
         <el-tab-pane label="本地" name="local">
-          <div v-if="sourceDrawer.data.references.length || sourceDrawer.data.chunks.length || sourceDrawer.data.trace || sourceDrawer.data.raw" class="drawer-stack">
+          <div
+            v-if="
+              sourceDrawer.data.runSummaryRows.length
+                || sourceDrawer.data.references.length
+                || sourceDrawer.data.chunks.length
+                || sourceDrawer.data.trace
+                || sourceDrawer.data.artifacts.length
+                || sourceDrawer.data.scAnalysisMeta
+                || sourceDrawer.data.analysisParams
+                || sourceDrawer.data.analysisResult
+                || sourceDrawer.data.pdfInterpretation
+                || sourceDrawer.data.raw
+            "
+            class="drawer-stack"
+          >
+            <section v-if="sourceDrawer.data.runSummaryRows.length" class="drawer-section">
+              <h3>运行摘要</h3>
+              <div class="drawer-summary-grid">
+                <div
+                  v-for="row in sourceDrawer.data.runSummaryRows"
+                  :key="`${row.label}-${row.value}`"
+                  class="drawer-summary-item"
+                >
+                  <span>{{ row.label }}</span>
+                  <strong>{{ row.value }}</strong>
+                </div>
+              </div>
+            </section>
+
             <section v-if="sourceDrawer.data.references.length" class="drawer-section">
               <h3>参考来源</h3>
               <el-card
@@ -1503,6 +1715,49 @@ onBeforeUnmount(() => {
                 <p>{{ chunk.text || '' }}</p>
                 <small>score={{ Number(chunk.score || 0).toFixed(4) }} | source={{ chunk.retrieval_source || 'unknown' }}</small>
               </el-card>
+            </section>
+
+            <section v-if="sourceDrawer.data.artifacts.length" class="drawer-section">
+              <h3>结果文件</h3>
+              <el-card
+                v-for="(artifact, index) in sourceDrawer.data.artifacts"
+                :key="`${artifact.path || artifact.url || artifact.name}-${index}`"
+                shadow="never"
+              >
+                <template #header>{{ artifact.name || artifact.kind || `artifact-${index + 1}` }}</template>
+                <p>{{ artifact.path || artifact.url || '' }}</p>
+                <a
+                  v-if="artifact.url"
+                  class="artifact-link"
+                  :href="artifact.url"
+                  target="_blank"
+                  rel="noreferrer noopener"
+                >
+                  打开文件
+                </a>
+              </el-card>
+            </section>
+
+            <section v-if="sourceDrawer.data.pdfInterpretation" class="drawer-section">
+              <h3>PDF 图表解读</h3>
+              <el-card shadow="never">
+                <p>{{ sourceDrawer.data.pdfInterpretation }}</p>
+              </el-card>
+            </section>
+
+            <section v-if="sourceDrawer.data.scAnalysisMeta" class="drawer-section">
+              <h3>单细胞分析元信息</h3>
+              <pre>{{ prettyJson(sourceDrawer.data.scAnalysisMeta) }}</pre>
+            </section>
+
+            <section v-if="sourceDrawer.data.analysisParams" class="drawer-section">
+              <h3>function calling 参数</h3>
+              <pre>{{ prettyJson(sourceDrawer.data.analysisParams) }}</pre>
+            </section>
+
+            <section v-if="sourceDrawer.data.analysisResult" class="drawer-section">
+              <h3>单细胞分析结果</h3>
+              <pre>{{ prettyJson(sourceDrawer.data.analysisResult) }}</pre>
             </section>
 
             <section v-if="sourceDrawer.data.trace" class="drawer-section">
@@ -1580,7 +1835,13 @@ onBeforeUnmount(() => {
                   [{{ result.source_tier || 'web' }}] {{ result.title || 'Untitled' }}
                 </template>
                 <p>{{ result.snippet || '' }}</p>
-                <small>score={{ Number(result.score || 0).toFixed(2) }} | tier={{ result.source_tier || 'web' }}</small>
+                <small>
+                  score={{ Number(result.score || 0).toFixed(4) }}
+                  | rrf={{ Number(result.rrf_score || 0).toFixed(4) }}
+                  | bm25={{ Number(result.bm25_score || 0).toFixed(4) }}
+                  | vector={{ Number(result.vector_score || 0).toFixed(4) }}
+                  | tier={{ result.source_tier || 'web' }}
+                </small>
                 <a
                   v-if="result.url"
                   class="artifact-link"
@@ -1626,6 +1887,9 @@ onBeforeUnmount(() => {
                 </el-form-item>
                 <el-form-item label="长期记忆检索 Top K">
                   <el-input-number v-model="workspace.settings.long_term_top_k" :min="1" :max="20" />
+                </el-form-item>
+                <el-form-item label="Multi-query 召回数量">
+                  <el-input-number v-model="workspace.settings.multi_query_count" :min="1" :max="8" :step="1" />
                 </el-form-item>
                 <el-form-item label="本地知识最低置信度">
                   <el-input-number v-model="workspace.settings.local_source_min_score" :min="0" :max="10" :step="0.05" />
@@ -2300,6 +2564,39 @@ body {
   margin: 0;
   font-size: 15px;
   color: #f4f4f5;
+}
+
+.drawer-section p {
+  overflow-wrap: anywhere;
+}
+
+.drawer-summary-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+  gap: 10px;
+}
+
+.drawer-summary-item {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  min-width: 0;
+  padding: 12px;
+  border-radius: 12px;
+  background: rgba(255, 255, 255, 0.04);
+  border: 1px solid rgba(255, 255, 255, 0.06);
+}
+
+.drawer-summary-item span {
+  color: var(--app-muted);
+  font-size: 12px;
+}
+
+.drawer-summary-item strong {
+  color: var(--app-text);
+  font-size: 13px;
+  font-weight: 600;
+  overflow-wrap: anywhere;
 }
 
 .drawer-section pre {
