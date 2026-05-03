@@ -1,25 +1,27 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PYTHON_BIN="enter/envs/agent/bin/python"
-MYSQL_BASE="local/mysql"
+SCRIPT_DIR="$(dirname "${BASH_SOURCE[0]}")"
+cd "${SCRIPT_DIR}"
+
+PYTHON_BIN="../enter/envs/agent/bin/python"
+MYSQL_BASE="../local/mysql"
 MYSQL_CNF="${MYSQL_BASE}/etc/my.cnf"
 MYSQL_LOG="${MYSQL_BASE}/logs/mysqld_safe.out"
 MYSQL_DATA_FILE="${MYSQL_BASE}/data/ibdata1"
 MYSQLADMIN_BIN="${MYSQL_BASE}/bin/mysqladmin"
 
-REDIS_BIN="local/redis-stack-server-6.2.6/bin/redis-stack-server"
-REDIS_CLI="local/redis-stack-server-6.2.6/bin/redis-cli"
+REDIS_BIN="../local/redis-stack-server-6.2.6/bin/redis-stack-server"
+REDIS_CLI="../local/redis-stack-server-6.2.6/bin/redis-cli"
 REDIS_HOST="127.0.0.1"
 REDIS_PORT="6379"
-REDIS_DATA_DIR="local/redis-stack-data"
-REDIS_LOG="local/redis-stack-log/redis-stack.log"
+REDIS_DATA_DIR="../local/redis-stack-data"
+REDIS_LOG="../local/redis-stack-log/redis-stack.log"
 
-VLLM_PID_FILE="agent/data/vllm.pid"
+VLLM_PID_FILE="data/vllm.pid"
 VLLM_PORT="${VLLM_PORT:-8080}"
-BACKEND_LOG="${AGENT_BACKEND_LOG:-agent/data/backend_log.txt}"
-export VLLM_BIN="${VLLM_BIN:-enter/envs/agent/bin/vllm}"
+BACKEND_LOG="${AGENT_BACKEND_LOG:-data/backend_log.txt}"
+export VLLM_BIN="${VLLM_BIN:-../enter/envs/agent/bin/vllm}"
 export VLLM_GPU_MEMORY_UTILIZATION="${VLLM_GPU_MEMORY_UTILIZATION:-0.70}"
 
 STARTED_MYSQL=0
@@ -366,7 +368,6 @@ trap 'exit 143' TERM
 start_mysql
 start_redis
 
-cd "${ROOT_DIR}"
 if [ "$#" -eq 0 ]; then
   set -- --host 127.0.0.1 --port 8000
 fi
