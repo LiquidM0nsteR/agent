@@ -90,6 +90,57 @@ def safe_relpath(value: str) -> Path:
     return path
 
 
+def directory_size_bytes(root: str | Path) -> int:
+    base = Path(root)
+    if not base.exists():
+        return 0
+    return sum(path.stat().st_size for path in base.rglob("*") if path.is_file())
+
+
+def inspect_upload_batch(
+    uploads: list[Any],
+    *,
+    allowed_suffixes: set[str] | tuple[str, ...],
+    max_files: int,
+    max_file_size_bytes: int,
+    quota_root: str | Path | None = None,
+    quota_bytes: int = 0,
+) -> list[dict[str, Any]]:
+    upload_list = list(uploads or [])
+    if not upload_list:
+        raise ValueError("No files uploaded")
+    if len(upload_list) > max_files:
+        raise ValueError(f"Too many files: {len(upload_list)} > {max_files}")
+
+    allowed = {item.lower() for item in allowed_suffixes}
+    inspected: list[dict[str, Any]] = []
+    incoming_bytes = 0
+    for upload in upload_list:
+        safe_name = safe_filename(getattr(upload, "filename", ""))
+        suffix = Path(safe_name).suffix.lower()
+        if suffix not in allowed:
+            raise ValueError(f"Unsupported file suffix for {safe_name}: {suffix or '<none>'}. Allowed: {', '.join(sorted(allowed))}")
+        file_obj = getattr(upload, "file", None)
+        if file_obj is None:
+            raise ValueError(f"Upload file handle is missing: {safe_name}")
+        current_pos = file_obj.tell()
+        file_obj.seek(0, os.SEEK_END)
+        size_bytes = int(file_obj.tell())
+        file_obj.seek(current_pos)
+        if size_bytes <= 0:
+            raise ValueError(f"Uploaded file is empty: {safe_name}")
+        if size_bytes > max_file_size_bytes:
+            raise ValueError(f"Uploaded file is too large: {safe_name} ({size_bytes} > {max_file_size_bytes} bytes)")
+        incoming_bytes += size_bytes
+        inspected.append({"safe_name": safe_name, "suffix": suffix, "size_bytes": size_bytes})
+
+    if quota_root is not None and quota_bytes > 0:
+        used_bytes = directory_size_bytes(quota_root)
+        if used_bytes + incoming_bytes > quota_bytes:
+            raise ValueError(f"Knowledge upload quota exceeded: current={used_bytes}, incoming={incoming_bytes}, quota={quota_bytes} bytes")
+    return inspected
+
+
 def truncate_text(text: str, limit: int = 96) -> str:
     compact = " ".join(str(text or "").split())
     return compact if len(compact) <= limit else compact[: limit - 3].rstrip() + "..."

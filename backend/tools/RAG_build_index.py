@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import argparse
 import json
 import os
 import pickle
@@ -263,3 +264,23 @@ def build_rag_index(knowledge_base_path: str = "", index_dir: str = "", files: l
         "skipped_sources": skipped_sources,
         "metrics": {"tool_ms": round((time.perf_counter() - started_at) * 1000, 2)},
     }
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description="Build the local RAG index.")
+    parser.add_argument("--knowledge-base-path", default="", help="Directory containing local knowledge files.")
+    parser.add_argument("--index-dir", default="", help="Directory where the index files are written.")
+    parser.add_argument("--file", action="append", default=None, help="Optional file to index. Can be provided multiple times.")
+    args = parser.parse_args()
+    result = build_rag_index(
+        knowledge_base_path=args.knowledge_base_path,
+        index_dir=args.index_dir,
+        files=args.file,
+        clean=True,
+    )
+    print(json.dumps(result, ensure_ascii=False, indent=2))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -25,4 +25,3 @@ logs/
 .idea/
 
 .ipynb_checkpoints/
-.env.example

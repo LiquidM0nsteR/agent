@@ -2,24 +2,24 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PYTHON_BIN="/share/home/bgi_cxiongzy/enter/envs/agent/bin/python"
-MYSQL_BASE="/share/home/bgi_cxiongzy/local/mysql"
+PYTHON_BIN="enter/envs/agent/bin/python"
+MYSQL_BASE="local/mysql"
 MYSQL_CNF="${MYSQL_BASE}/etc/my.cnf"
 MYSQL_LOG="${MYSQL_BASE}/logs/mysqld_safe.out"
 MYSQL_DATA_FILE="${MYSQL_BASE}/data/ibdata1"
 MYSQLADMIN_BIN="${MYSQL_BASE}/bin/mysqladmin"
 
-REDIS_BIN="/share/home/bgi_cxiongzy/local/redis-stack-server-6.2.6/bin/redis-stack-server"
-REDIS_CLI="/share/home/bgi_cxiongzy/local/redis-stack-server-6.2.6/bin/redis-cli"
+REDIS_BIN="local/redis-stack-server-6.2.6/bin/redis-stack-server"
+REDIS_CLI="local/redis-stack-server-6.2.6/bin/redis-cli"
 REDIS_HOST="127.0.0.1"
 REDIS_PORT="6379"
-REDIS_DATA_DIR="/share/home/bgi_cxiongzy/local/redis-stack-data"
-REDIS_LOG="/share/home/bgi_cxiongzy/local/redis-stack-log/redis-stack.log"
+REDIS_DATA_DIR="local/redis-stack-data"
+REDIS_LOG="local/redis-stack-log/redis-stack.log"
 
-VLLM_PID_FILE="/share/home/bgi_cxiongzy/agent/data/vllm.pid"
+VLLM_PID_FILE="agent/data/vllm.pid"
 VLLM_PORT="${VLLM_PORT:-8080}"
-BACKEND_LOG="${AGENT_BACKEND_LOG:-/share/home/bgi_cxiongzy/agent/data/backend_log.txt}"
-export VLLM_BIN="${VLLM_BIN:-/share/home/bgi_cxiongzy/enter/envs/agent/bin/vllm}"
+BACKEND_LOG="${AGENT_BACKEND_LOG:-agent/data/backend_log.txt}"
+export VLLM_BIN="${VLLM_BIN:-enter/envs/agent/bin/vllm}"
 export VLLM_GPU_MEMORY_UTILIZATION="${VLLM_GPU_MEMORY_UTILIZATION:-0.70}"
 
 STARTED_MYSQL=0

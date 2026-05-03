@@ -43,6 +43,17 @@ def env_bool(name: str, default: bool) -> bool:
     return raw.strip().lower() in {"1", "true", "yes", "on"}
 
 
+def env_suffixes(name: str, default: tuple[str, ...]) -> tuple[str, ...]:
+    raw = os.getenv(name)
+    values = raw.split(",") if raw else default
+    suffixes = {
+        item.strip().lower() if item.strip().startswith(".") else f".{item.strip().lower()}"
+        for item in values
+        if item.strip()
+    }
+    return tuple(sorted(suffixes))
+
+
 def env_path(name: str, default: str | Path) -> Path:
     return Path(os.getenv(name, str(default))).expanduser()
 
@@ -69,6 +80,12 @@ WORKSPACE_SETTINGS_DEFAULTS: dict[str, Any] = {
     "search_provider": env_str("AGENT_SEARCH_PROVIDER", "serper"),
     "search_prefers_official_sources": env_bool("AGENT_SEARCH_PREFERS_OFFICIAL_SOURCES", True),
 }
+KNOWLEDGE_UPLOAD_ALLOWED_SUFFIXES = env_suffixes("AGENT_KNOWLEDGE_UPLOAD_ALLOWED_SUFFIXES", (".pdf", ".txt", ".md", ".markdown", ".docx"))
+KNOWLEDGE_UPLOAD_MAX_FILES = env_int("AGENT_KNOWLEDGE_UPLOAD_MAX_FILES", 10)
+KNOWLEDGE_UPLOAD_MAX_FILE_SIZE_BYTES = env_int("AGENT_KNOWLEDGE_UPLOAD_MAX_FILE_SIZE_BYTES", 50 * 1024 * 1024)
+KNOWLEDGE_UPLOAD_TOTAL_QUOTA_BYTES = env_int("AGENT_KNOWLEDGE_UPLOAD_TOTAL_QUOTA_BYTES", 1024 * 1024 * 1024)
+KNOWLEDGE_UPLOAD_LOCK_PATH = DATA_DIR / "knowledge_upload.lock"
+KNOWLEDGE_UPLOAD_LOCK_TIMEOUT_SECONDS = env_float("AGENT_KNOWLEDGE_UPLOAD_LOCK_TIMEOUT_SECONDS", 10.0)
 
 
 # =========================
@@ -194,6 +211,7 @@ def ensure_runtime_dirs() -> None:
         LOCAL_KNOWLEDGE_INDEX_DIR,
         LOG_DIR,
         BACKEND_LOG_PATH.parent,
+        KNOWLEDGE_UPLOAD_LOCK_PATH.parent,
         REDIS_STACK_DATA_DIR,
         REDIS_STACK_LOG_PATH.parent,
         MYSQL_LOG_PATH.parent,
@@ -238,6 +256,11 @@ def export_runtime_env() -> None:
         "RAG_RERANK_BATCH_SIZE": str(RAG_RERANK_BATCH_SIZE),
         "RAG_RERANK_MAX_LENGTH": str(RAG_RERANK_MAX_LENGTH),
         "AGENT_RAG_CONFIDENCE_THRESHOLD": str(RAG_CONFIDENCE_THRESHOLD),
+        "AGENT_KNOWLEDGE_UPLOAD_ALLOWED_SUFFIXES": ",".join(KNOWLEDGE_UPLOAD_ALLOWED_SUFFIXES),
+        "AGENT_KNOWLEDGE_UPLOAD_MAX_FILES": str(KNOWLEDGE_UPLOAD_MAX_FILES),
+        "AGENT_KNOWLEDGE_UPLOAD_MAX_FILE_SIZE_BYTES": str(KNOWLEDGE_UPLOAD_MAX_FILE_SIZE_BYTES),
+        "AGENT_KNOWLEDGE_UPLOAD_TOTAL_QUOTA_BYTES": str(KNOWLEDGE_UPLOAD_TOTAL_QUOTA_BYTES),
+        "AGENT_KNOWLEDGE_UPLOAD_LOCK_TIMEOUT_SECONDS": str(KNOWLEDGE_UPLOAD_LOCK_TIMEOUT_SECONDS),
     }
     for key, value in values.items():
         if value != "":

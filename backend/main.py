@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
+import portalocker
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
@@ -38,6 +39,7 @@ from .util import (
     current_turn_steps,
     current_turn_tool_results,
     has_session_rag_sources,
+    inspect_upload_batch,
     is_rag_upload_candidate,
     new_session_id,
     now_iso,
@@ -671,11 +673,38 @@ async def list_knowledge_files() -> dict[str, Any]:
 
 @app.post("/api/workspace/knowledge/files")
 async def upload_knowledge_files(files: list[UploadFile] = File(...)) -> dict[str, Any]:
-    for upload in files:
-        destination = LOCAL_KNOWLEDGE_DIR / f"{uuid4().hex}_{safe_filename(upload.filename)}"
-        with destination.open("wb") as handle:
-            shutil.copyfileobj(upload.file, handle)
-    return {"status": "ok", "files": _list_knowledge_files()}
+    try:
+        with portalocker.Lock(str(C.KNOWLEDGE_UPLOAD_LOCK_PATH), timeout=C.KNOWLEDGE_UPLOAD_LOCK_TIMEOUT_SECONDS):
+            inspected_files = inspect_upload_batch(
+                files,
+                allowed_suffixes=C.KNOWLEDGE_UPLOAD_ALLOWED_SUFFIXES,
+                max_files=C.KNOWLEDGE_UPLOAD_MAX_FILES,
+                max_file_size_bytes=C.KNOWLEDGE_UPLOAD_MAX_FILE_SIZE_BYTES,
+                quota_root=LOCAL_KNOWLEDGE_DIR,
+                quota_bytes=C.KNOWLEDGE_UPLOAD_TOTAL_QUOTA_BYTES,
+            )
+            saved_files = []
+            for upload, inspected in zip(files, inspected_files):
+                destination = LOCAL_KNOWLEDGE_DIR / f"{uuid4().hex}_{inspected['safe_name']}"
+                upload.file.seek(0)
+                with destination.open("wb") as handle:
+                    shutil.copyfileobj(upload.file, handle)
+                saved_files.append({"path": destination.relative_to(LOCAL_KNOWLEDGE_DIR).as_posix(), "name": destination.name, "size_bytes": destination.stat().st_size})
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except portalocker.exceptions.LockException as exc:
+        raise HTTPException(status_code=423, detail=f"Knowledge upload lock timeout: {exc}") from exc
+    return {
+        "status": "ok",
+        "uploaded": saved_files,
+        "limits": {
+            "allowed_suffixes": sorted(C.KNOWLEDGE_UPLOAD_ALLOWED_SUFFIXES),
+            "max_files": C.KNOWLEDGE_UPLOAD_MAX_FILES,
+            "max_file_size_bytes": C.KNOWLEDGE_UPLOAD_MAX_FILE_SIZE_BYTES,
+            "total_quota_bytes": C.KNOWLEDGE_UPLOAD_TOTAL_QUOTA_BYTES,
+        },
+        "files": _list_knowledge_files(),
+    }
 
 
 @app.delete("/api/workspace/knowledge/files/{file_path:path}")
